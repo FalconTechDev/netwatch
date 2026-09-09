@@ -1,0 +1,65 @@
+name: Release
+
+# One target, because netwatch reads a Windows kernel provider and there is
+# nothing to run anywhere else. Built on a Windows runner rather than
+# cross-compiled, so the binary is made by the system it will run on.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+      # The tests cover the arithmetic and the layout, neither of which needs a
+      # trace session — so they run here, unelevated, like any other build.
+      - run: cargo test --release
+
+      - run: cargo build --release
+
+      - name: Package
+        shell: bash
+        run: |
+          name="netwatch-${{ github.ref_name }}-x86_64-pc-windows-msvc"
+          mkdir -p "dist/$name"
+          cp target/release/netwatch.exe "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
+          cd dist
+          7z a "$name.zip" "$name" > /dev/null
+          # A checksum beside the archive, so the installer can verify what it
+          # downloaded rather than trusting the transfer.
+          sha256sum "$name.zip" > "$name.zip.sha256"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/*.sha256
+            install.ps1
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            ```powershell
+            irm https://github.com/${{ github.repository }}/releases/latest/download/install.ps1 | iex
+            ```
+
+            Puts `netwatch` on your PATH. No administrator rights to install —
+            though netwatch itself needs an elevated terminal to run, because
+            reading which process sent a packet is a kernel-level question and
+            Windows only answers it for an elevated session.

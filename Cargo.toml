@@ -1,0 +1,22 @@
+[package]
+name = "netwatch"
+version = "0.1.0"
+edition = "2024"
+
+description = "See which program is using your connection, live"
+license = "MIT"
+
+[dependencies]
+ferrisetw = "1.2.0"
+ratatui = "0.29"
+clap = { version = "4", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+] }
+
+[profile.release]
+lto = true
+codegen-units = 1
