@@ -40,15 +40,38 @@ netwatch report --hours 12  # what used the connection while you were away
  Enter who it talks to   t sort by rate/total   j k move   q quit
 ```
 
-`Enter` opens where one program has been talking:
+`Enter` opens what one program actually is, and where it has been talking:
 
 ```
-┌ firefox.exe — 2 peers, Esc closes ───────────────────────────────┐
-│PEER                              PROTO        DOWN            UP │
-│185.184.222.3:443                   TCP    626.2 KB       86.1 KB │
-│140.82.114.25:443                   TCP    205.1 KB           0 B │
-└──────────────────────────────────────────────────────────────────┘
+┌ Mozilla Firefox — Esc closes ────────────────────────────────────────────┐
+│described Mozilla Firefox                                                 │
+│publisher Mozilla Corporation                                             │
+│path      C:\Program Files\Mozilla Firefox\firefox.exe                    │
+│traffic   831.2 KB down · 86.1 KB up · pid 6124 · 2 peers                 │
+│                                                                          │
+│PEER                                       PROTO        DOWN          UP  │
+│185.184.222.3:443                            TCP    626.2 KB     86.1 KB  │
+│140.82.114.25:443                            TCP    205.1 KB         0 B  │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
+
+The path is the point. `svchost.exe` in `System32`, published by Microsoft, is
+the operating system. The same name from a temp directory, claiming nothing
+about itself, is the single most useful thing this screen can show — and the
+absence is shown as an absence rather than as a blank line:
+
+```
+┌ mystery.exe — Esc closes ────────────────────────────────────────────────┐
+│described no description in the file                                      │
+│publisher no publisher named in the file                                  │
+│path      C:\Users\you\AppData\Local\Temp\mystery.exe                     │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+None of that is a verdict. The description and the publisher are strings the
+file claims about itself and nothing verifies them; a familiar path is a
+statement about tidiness, never about trust. They are shown because they are
+what a person needs in order to start asking the right question.
 
 ## What was downloading while you slept
 
@@ -93,6 +116,19 @@ WHERE THE BULK WENT                                 BYTES
 52.216.18.11:443                                   31.4 GB
 52.216.140.99:443                                   7.2 GB
 ```
+
+The same in the reports, where it matters more — by then the process is gone
+and cannot be asked:
+
+```
+$ netwatch report --program backup-agent --hours 12
+backup-agent.exe — last 12 h: 38.2 GB down, 412.0 MB up, over 184 minutes
+  ran from C:\Users\you\AppData\Roaming\backup\backup-agent.exe
+```
+
+In the summary a path is printed only when it is somewhere other than the
+ordinary places — a line under every Windows component saying `System32` is
+noise, and the point is the one that does not belong.
 
 ### The log
 
