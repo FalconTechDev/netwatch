@@ -40,7 +40,7 @@ one, `x` to stop one, `q` to quit.
 │ backup-agent.exe       4852 ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄    29.3 KB/s     3.9 KB/s  735.5 KB      1 │
 │ mystery.exe            2628 ▁▁▁▁▁█▁▁▁▁▁▁▁▁▁▁▁▁▁      200 B/s            —  883.4 KB      1 │
 └────────────────────────────────────────────────────────────────────────────────────────────┘
- Enter details   h hide   H show hidden   x stop   t sort   j k move   q quit
+ / find  space hold  a active  ↵ details  h hide  H hidden  x stop  t sort  j k move  q quit
 ```
 
 The shape in `LAST MINUTE` says what a number cannot: `firefox` is ramping up,
@@ -172,6 +172,24 @@ while it is being written, and inspected with a text editor. A binary format
 would be smaller and would make a year of your own data hostage to this program
 still existing and still being able to parse it. Files older than thirty days
 are deleted — `--keep-days` changes that.
+
+## Finding one program among forty
+
+`/` — or `Ctrl+F` — narrows the list as you type. It matches the program's name,
+what the file says it is, its publisher, its pid, **and every host it has talked
+to** — so `github` finds the program that went there, which is usually the
+question. The program's own name never contains that answer.
+
+`space` holds the order. A list that re-sorts every second cannot be aimed at:
+the row you were about to press `Enter` on has already moved. Holding freezes
+the order while the numbers keep updating, and anything new that turns up is
+appended rather than hidden — a list that quietly omitted the present while
+"paused" would be worse than one that jumps.
+
+`a` leaves out everything that is not moving right now.
+
+All three narrow the **view** and nothing else, the same promise hiding makes:
+everything is still measured, still logged, still in every report.
 
 ## Hiding, and stopping
 

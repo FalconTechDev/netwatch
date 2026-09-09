@@ -10,7 +10,7 @@ use std::io;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use ratatui::crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind};
+use ratatui::crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -49,6 +49,15 @@ struct App {
     confirm: Option<Confirm>,
     /// The last thing that happened, said once in the header.
     status: String,
+    /// What to match against, and whether the box has focus.
+    search: String,
+    searching: bool,
+    /// Only programs moving something right now.
+    only_active: bool,
+    /// The order to draw in, held so rows stop moving under the cursor. The
+    /// numbers stay live — it is the ordering that makes a list impossible to
+    /// act on, not the values.
+    frozen: Option<Vec<u32>>,
     started: Instant,
 }
 
@@ -59,11 +68,47 @@ impl App {
     /// must not know about it, or hiding something would stop it being
     /// measured.
     fn visible(&self) -> Vec<&Process> {
-        self.state
+        let mut v: Vec<&Process> = self
+            .state
             .ranked(self.by_rate)
             .into_iter()
             .filter(|p| self.show_hidden || !self.hidden.is_hidden(&p.name))
-            .collect()
+            .filter(|p| !self.only_active || p.rate() >= 1.0)
+            .filter(|p| self.matches(p))
+            .collect();
+
+        // Held order: whatever was on screen when it was held, in that order,
+        // with anything new appended rather than dropped — a list that hides
+        // new arrivals while "paused" would be lying about the present.
+        if let Some(order) = &self.frozen {
+            v.sort_by_key(|p| {
+                order
+                    .iter()
+                    .position(|pid| *pid == p.pid)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        v
+    }
+
+    /// Matches a program by its own name, by what the file says it is, or by
+    /// any host it has talked to — so "github" finds the program that went
+    /// there, which is usually the question rather than the program's name.
+    fn matches(&self, p: &Process) -> bool {
+        let q = self.search.trim().to_lowercase();
+        if q.is_empty() {
+            return true;
+        }
+        p.name.to_lowercase().contains(&q)
+            || p.info.description.to_lowercase().contains(&q)
+            || p.info.company.to_lowercase().contains(&q)
+            || p.pid.to_string() == q
+            || p.peers.values().any(|peer| {
+                peer.host
+                    .as_deref()
+                    .is_some_and(|h| h.to_lowercase().contains(&q))
+                    || peer.addr.to_string().contains(&q)
+            })
     }
 
     fn selected(&self) -> Option<(u32, String, String)> {
@@ -86,6 +131,10 @@ pub fn run() -> Result<(), String> {
         show_hidden: false,
         confirm: None,
         status: String::new(),
+        search: String::new(),
+        searching: false,
+        only_active: false,
+        frozen: None,
         started: Instant::now(),
     };
 
@@ -155,10 +204,53 @@ fn event_loop<B: Backend>(
             continue;
         }
 
+        // While the search box has focus every printable key belongs to it,
+        // or typing "hex" into it would hide a program, show the hidden ones
+        // and offer to kill something.
+        if app.searching {
+            match key.code {
+                KeyCode::Enter => app.searching = false,
+                KeyCode::Esc => {
+                    app.searching = false;
+                    app.search.clear();
+                }
+                KeyCode::Backspace => {
+                    app.search.pop();
+                }
+                KeyCode::Char(c) => app.search.push(c),
+                _ => {}
+            }
+            app.table.select(Some(0));
+            continue;
+        }
+
         let rows = app.visible().len();
         match key.code {
             KeyCode::Char('q') => return Ok(()),
+            // Both, because one of them is what the hands already know.
+            KeyCode::Char('/') => app.searching = true,
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.searching = true
+            }
+            KeyCode::Char('a') => {
+                app.only_active = !app.only_active;
+                app.table.select(Some(0));
+            }
+            // Holding the order is what makes the list possible to act on: a
+            // row that resorts every second cannot be aimed at.
+            KeyCode::Char(' ') => {
+                app.frozen = match app.frozen {
+                    Some(_) => None,
+                    None => Some(app.visible().iter().map(|p| p.pid).collect()),
+                };
+            }
             KeyCode::Esc if app.expanded.is_some() => app.expanded = None,
+            // Esc undoes the narrowing before it quits, so it never throws
+            // away a search someone is halfway through reading.
+            KeyCode::Esc if !app.search.is_empty() => {
+                app.search.clear();
+                app.table.select(Some(0));
+            }
             KeyCode::Esc => return Ok(()),
             KeyCode::Char('t') => app.by_rate = !app.by_rate,
             // Hiding is per program name, so a restart stays hidden.
@@ -257,8 +349,11 @@ fn sparkline(history: &std::collections::VecDeque<f64>, width: usize) -> String 
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
+    // The search line takes no room until there is something to say in it.
+    let search_height = u16::from(app.searching || !app.search.is_empty());
     let chunks = Layout::vertical([
         Constraint::Length(1),
+        Constraint::Length(search_height),
         Constraint::Min(1),
         Constraint::Length(1),
     ])
@@ -315,8 +410,9 @@ fn draw(f: &mut Frame, app: &mut App) {
             ),
             Span::styled(
                 format!(
-                    "{} programs · {} in {}m{:02}s · by {}",
+                    "{} program{} · {} in {}m{:02}s · by {}",
                     shown,
+                    if shown == 1 { "" } else { "s" },
                     bytes(app.state.total.total()),
                     elapsed / 60,
                     elapsed % 60,
@@ -337,6 +433,24 @@ fn draw(f: &mut Frame, app: &mut App) {
                 Style::new().fg(Color::Yellow),
             ),
             Span::styled(
+                if app.only_active {
+                    " · active only"
+                } else {
+                    ""
+                },
+                Style::new().fg(Color::Yellow),
+            ),
+            // A held list keeps updating its numbers, so nothing else on
+            // screen would show that it has stopped reordering.
+            Span::styled(
+                if app.frozen.is_some() {
+                    " · order held"
+                } else {
+                    ""
+                },
+                Style::new().fg(Color::Yellow),
+            ),
+            Span::styled(
                 if app.status.is_empty() {
                     String::new()
                 } else {
@@ -347,6 +461,30 @@ fn draw(f: &mut Frame, app: &mut App) {
         ])),
         chunks[0],
     );
+
+    // ── search ────────────────────────────────────────────────────────────
+    if search_height > 0 {
+        let hint = if app.searching {
+            "  Enter keeps it · Esc clears"
+        } else {
+            "  Esc clears"
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " find ",
+                    Style::new().bg(Color::Cyan).fg(Color::Black).bold(),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    format!("{}{}", app.search, if app.searching { "█" } else { "" }),
+                    Style::new().fg(Color::Cyan),
+                ),
+                Span::styled(hint, Style::new().fg(Color::DarkGray)),
+            ])),
+            chunks[1],
+        );
+    }
 
     // ── table ───────────────────────────────────────────────────────────────
     let header = Row::new(
@@ -395,11 +533,11 @@ fn draw(f: &mut Frame, app: &mut App) {
             )
             .row_highlight_style(Style::new().bg(Color::Rgb(38, 45, 56)))
             .highlight_symbol("▌"),
-        chunks[1],
+        chunks[2],
         &mut app.table,
     );
 
-    let visible = chunks[1].height.saturating_sub(3) as usize;
+    let visible = chunks[2].height.saturating_sub(3) as usize;
     if shown > visible {
         let mut sb = ScrollbarState::new(shown).position(app.table.selected().unwrap_or(0));
         f.render_stateful_widget(
@@ -407,7 +545,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                 .begin_symbol(None)
                 .end_symbol(None)
                 .thumb_style(Style::new().fg(Color::DarkGray)),
-            chunks[1].inner(Margin {
+            chunks[2].inner(Margin {
                 vertical: 1,
                 horizontal: 0,
             }),
@@ -420,22 +558,28 @@ fn draw(f: &mut Frame, app: &mut App) {
     let dim = Style::new().fg(Color::DarkGray);
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" Enter", key),
-            Span::styled(" details   ", dim),
+            Span::styled(" /", key),
+            Span::styled(" find  ", dim),
+            Span::styled("space", key),
+            Span::styled(" hold  ", dim),
+            Span::styled("a", key),
+            Span::styled(" active  ", dim),
+            Span::styled("↵", key),
+            Span::styled(" details  ", dim),
             Span::styled("h", key),
-            Span::styled(" hide   ", dim),
+            Span::styled(" hide  ", dim),
             Span::styled("H", key),
-            Span::styled(" show hidden   ", dim),
+            Span::styled(" hidden  ", dim),
             Span::styled("x", key),
-            Span::styled(" stop   ", dim),
+            Span::styled(" stop  ", dim),
             Span::styled("t", key),
-            Span::styled(" sort   ", dim),
+            Span::styled(" sort  ", dim),
             Span::styled("j k", key),
-            Span::styled(" move   ", dim),
+            Span::styled(" move  ", dim),
             Span::styled("q", key),
             Span::styled(" quit", dim),
         ])),
-        chunks[2],
+        chunks[3],
     );
 
     if let Some(c) = &app.confirm {
@@ -800,6 +944,10 @@ mod tests {
             show_hidden: false,
             confirm: None,
             status: String::new(),
+            search: String::new(),
+            searching: false,
+            only_active: false,
+            frozen: None,
             started: Instant::now(),
         }
     }
@@ -1086,6 +1234,126 @@ mod tests {
         let s = sparkline(&hist(&[9.0, 9.0, 9.0, 9.0, 9.0]), 3);
         assert_eq!(s.chars().count(), 3);
         assert!(sparkline(&hist(&[]), 8).is_empty());
+    }
+
+    /// Searching by program name is the obvious half. Searching by the host a
+    /// program talked to is the useful half: "who went to github" is the
+    /// question people actually have, and the program's own name does not
+    /// contain the answer.
+    #[test]
+    fn find_matches_names_and_the_hosts_they_talked_to() {
+        let mut app = demo();
+
+        app.search = "firefox".into();
+        assert_eq!(app.visible().len(), 1);
+        assert_eq!(app.visible()[0].name, "firefox.exe");
+
+        // Only firefox has a peer named api.github.com in the fixture.
+        app.search = "github".into();
+        assert_eq!(app.visible().len(), 1, "found by where it went");
+        assert_eq!(app.visible()[0].name, "firefox.exe");
+
+        // The description and publisher are searchable too, since that is what
+        // a person recognises a program by.
+        app.search = "mozilla".into();
+        assert_eq!(app.visible().len(), 1);
+
+        app.search = "no-such-thing".into();
+        assert!(app.visible().is_empty());
+    }
+
+    #[test]
+    fn find_is_case_insensitive_and_matches_a_pid() {
+        let mut app = demo();
+        app.search = "FIREFOX".into();
+        assert_eq!(app.visible().len(), 1);
+
+        app.search = "6124".into();
+        assert_eq!(app.visible()[0].pid, 6124);
+    }
+
+    /// Searching narrows the view and nothing else — the same promise hiding
+    /// makes. A search that stopped measurement would be a trap.
+    #[test]
+    fn find_narrows_the_view_and_not_the_record() {
+        let mut app = demo();
+        app.search = "firefox".into();
+        assert_eq!(app.visible().len(), 1);
+        assert_eq!(app.state.ranked(true).len(), 3, "all three still recorded");
+    }
+
+    #[test]
+    fn only_active_leaves_out_what_is_not_moving() {
+        let mut app = demo();
+        let all = app.visible().len();
+        app.only_active = true;
+        assert!(
+            app.visible().len() <= all,
+            "it can only ever remove rows, never add"
+        );
+        assert!(
+            app.visible().iter().all(|p| p.rate() >= 1.0),
+            "everything left is actually moving"
+        );
+    }
+
+    /// Holding stops rows moving under the cursor. What it must not do is hide
+    /// a program that turned up while it was held — a list that quietly omits
+    /// the present would be worse than one that jumps.
+    #[test]
+    fn a_held_order_still_admits_newcomers() {
+        let mut app = demo();
+        app.frozen = Some(vec![4852, 6124]); // deliberately not the sort order
+        let order: Vec<u32> = app.visible().iter().map(|p| p.pid).collect();
+
+        assert_eq!(order[0], 4852, "held order wins over the ranking");
+        assert_eq!(order[1], 6124);
+        assert_eq!(
+            order.len(),
+            3,
+            "the program missing from the held list is still shown"
+        );
+        assert_eq!(order[2], 2628, "and it goes last rather than vanishing");
+    }
+
+    #[test]
+    fn the_header_says_what_is_being_left_out() {
+        let mut app = demo();
+        app.only_active = true;
+        app.frozen = Some(vec![]);
+        let text = render(&mut app, 120, 12);
+        assert!(
+            text.contains("active only"),
+            "not stated:
+{text}"
+        );
+        assert!(
+            text.contains("order held"),
+            "not stated:
+{text}"
+        );
+    }
+
+    #[test]
+    fn the_find_box_shows_what_is_being_searched_for() {
+        let mut app = demo();
+        app.search = "github".into();
+        app.searching = true;
+        let text = render(&mut app, 120, 12);
+        println!(
+            "
+{text}"
+        );
+        assert!(
+            text.contains("find"),
+            "no box:
+{text}"
+        );
+        assert!(
+            text.contains("github"),
+            "the term is not shown:
+{text}"
+        );
     }
 
     #[test]
