@@ -6,6 +6,7 @@
 //! transfer against the process that caused it, and this reads that.
 
 mod etw;
+mod hidden;
 mod log;
 mod procs;
 mod report;
@@ -58,6 +59,12 @@ enum Cmd {
         #[arg(long)]
         dir: Option<std::path::PathBuf>,
     },
+    /// Programs kept out of the live view — still recorded, still in reports.
+    Hidden {
+        /// Show every program again.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Start recording at boot, or stop doing so.
     Service {
         #[command(subcommand)]
@@ -85,6 +92,7 @@ fn main() -> Result<(), String> {
             top,
             dir,
         } => report::run(&dir.unwrap_or_else(log::default_dir), hours, program, top),
+        Cmd::Hidden { clear } => hidden_list(clear),
         Cmd::Service { action } => service::run(action),
     }
 }
@@ -146,6 +154,37 @@ fn top(seconds: u64, by_total: bool) -> Result<(), String> {
         started.elapsed().as_secs_f64(),
         st.events
     );
+    Ok(())
+}
+
+/// What the live view is leaving out, and where that is written down.
+fn hidden_list(clear: bool) -> Result<(), String> {
+    let path = hidden::default_path();
+    let mut h = hidden::Hidden::load(path.clone());
+
+    if clear {
+        let n = h.len();
+        h.clear();
+        println!("Showing all {n} again.");
+        return Ok(());
+    }
+
+    if h.is_empty() {
+        println!("Nothing is hidden.");
+        println!();
+        println!("In the live view, `h` hides the selected program. It keeps");
+        println!("being recorded either way — hiding only changes the screen.");
+        return Ok(());
+    }
+
+    println!("Hidden from the live view ({}):", h.len());
+    for name in h.names() {
+        println!("  {name}");
+    }
+    println!();
+    println!("Still recorded, and still in every report.");
+    println!("Kept in {}", path.display());
+    println!("Show them all again:  netwatch hidden --clear");
     Ok(())
 }
 

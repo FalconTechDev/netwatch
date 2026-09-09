@@ -232,6 +232,67 @@ fn version_info(_path: &str) -> (String, String) {
     (String::new(), String::new())
 }
 
+/// Ask a process to stop.
+///
+/// This is `TerminateProcess`: the process is killed, not asked politely, and
+/// it gets no chance to save anything. That is what the caller wants when they
+/// have decided a program should stop talking right now, and it is why nothing
+/// here happens without a confirmation on the way in.
+///
+/// Killing the wrong thing can take the machine down — `wininit`, `csrss` and
+/// friends are not optional — so the decision belongs to the person, and this
+/// function only carries it out and reports what happened.
+#[cfg(windows)]
+pub fn terminate(pid: u32) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+
+    // SAFETY: the handle is checked before use and closed on every path.
+    unsafe {
+        let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if h.is_null() {
+            return Err(format!(
+                "cannot open pid {pid} — it has already exited, or it is protected"
+            ));
+        }
+        let ok = TerminateProcess(h, 1);
+        CloseHandle(h);
+        if ok == 0 {
+            return Err(format!("pid {pid} refused to stop"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn terminate(_pid: u32) -> Result<(), String> {
+    Err("stopping processes is implemented for Windows only".into())
+}
+
+/// Processes the machine cannot survive losing.
+///
+/// Not a security boundary — anything with the rights can still be stopped
+/// through Task Manager — but a name on this list means the confirmation says
+/// so in as many words, because "are you sure" is not enough warning when the
+/// answer is a blue screen.
+pub fn is_critical(name: &str) -> bool {
+    const CRITICAL: &[&str] = &[
+        "system",
+        "smss.exe",
+        "csrss.exe",
+        "wininit.exe",
+        "winlogon.exe",
+        "services.exe",
+        "lsass.exe",
+        "svchost.exe",
+        "fontdrvhost.exe",
+        "dwm.exe",
+        "memory compression",
+    ];
+    let n = name.to_lowercase();
+    CRITICAL.contains(&n.as_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

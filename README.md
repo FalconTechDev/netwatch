@@ -27,6 +27,9 @@ netwatch service install    # record from every boot, in the background
 netwatch report --hours 12  # what used the connection while you were away
 ```
 
+In the live view: `Enter` for what a program is and where it talks, `h` to hide
+one, `x` to stop one, `q` to quit.
+
 ## What it looks like
 
 ```
@@ -140,6 +143,41 @@ while it is being written, and inspected with a text editor. A binary format
 would be smaller and would make a year of your own data hostage to this program
 still existing and still being able to parse it. Files older than thirty days
 are deleted — `--keep-days` changes that.
+
+## Hiding, and stopping
+
+A machine has a dozen programs that talk constantly and tell you nothing. Once
+they are on screen every time, the screen stops being read — so `h` takes the
+selected one out of the list.
+
+**Hiding changes the view and nothing else.** A hidden program is still
+measured, still written to the log, still in every report. That distinction is
+the whole point: a filter that quietly stopped recording would turn "I did not
+want to look at it" into "I have no idea what it did", which is the opposite of
+what this is for. The header always says how many are hidden, `H` shows them
+again inline, and `netwatch hidden` lists them from the command line.
+
+`x` stops the selected program — after a question, never on the keystroke:
+
+```
+┌ Stop this program? ──────────────────────────────────────┐
+│lsass.exe  (pid 900)                                      │
+│C:\Windows\System32\lsass.exe                             │
+│                                                          │
+│It will be killed immediately. Anything it had not        │
+│saved is lost, and this cannot be undone.                 │
+│                                                          │
+│This is a core Windows process. Stopping it will          │
+│very likely crash the machine.                            │
+│                                                          │
+│  y  stop it        any other key  leave it alone         │
+└──────────────────────────────────────────────────────────┘
+```
+
+The red warning is not decoration. `TerminateProcess` gives a program no chance
+to save anything, and for `lsass`, `csrss` and their kind the honest description
+of what happens next is a crashed machine — "are you sure" does not carry that
+on its own.
 
 ## Rates and totals are different questions
 

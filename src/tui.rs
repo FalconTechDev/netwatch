@@ -21,8 +21,18 @@ use ratatui::widgets::{
     Table, TableState,
 };
 
-use crate::state::State;
+use crate::hidden::Hidden;
+use crate::procs;
+use crate::state::{Process, State};
 use crate::{bytes, etw, rate, trunc};
+
+/// A question the screen is waiting on before doing something irreversible.
+struct Confirm {
+    pid: u32,
+    name: String,
+    path: String,
+    critical: bool,
+}
 
 struct App {
     state: State,
@@ -31,7 +41,36 @@ struct App {
     by_rate: bool,
     /// The process whose peers are open, if any.
     expanded: Option<u32>,
+    /// Programs kept out of the list. Still recorded — this is the view only.
+    hidden: Hidden,
+    /// Show the hidden ones anyway, to remember what was hidden and undo it.
+    show_hidden: bool,
+    /// Set while a stop is waiting to be confirmed.
+    confirm: Option<Confirm>,
+    /// The last thing that happened, said once in the header.
+    status: String,
     started: Instant,
+}
+
+impl App {
+    /// The list as it is shown: ranked, then filtered by what is hidden.
+    ///
+    /// Filtering happens here rather than in `State` on purpose — the record
+    /// must not know about it, or hiding something would stop it being
+    /// measured.
+    fn visible(&self) -> Vec<&Process> {
+        self.state
+            .ranked(self.by_rate)
+            .into_iter()
+            .filter(|p| self.show_hidden || !self.hidden.is_hidden(&p.name))
+            .collect()
+    }
+
+    fn selected(&self) -> Option<(u32, String, String)> {
+        self.visible()
+            .get(self.table.selected().unwrap_or(0))
+            .map(|p| (p.pid, p.name.clone(), p.info.path.clone()))
+    }
 }
 
 pub fn run() -> Result<(), String> {
@@ -43,6 +82,10 @@ pub fn run() -> Result<(), String> {
         table: TableState::default().with_selected(0),
         by_rate: true,
         expanded: None,
+        hidden: Hidden::load(crate::hidden::default_path()),
+        show_hidden: false,
+        confirm: None,
+        status: String::new(),
         started: Instant::now(),
     };
 
@@ -92,20 +135,62 @@ fn event_loop<B: Backend>(
             continue;
         }
 
-        let rows = app.state.ranked(app.by_rate).len();
+        // A pending confirmation owns every key: nothing behind it may move
+        // while a question about stopping a process is on screen.
+        if let Some(c) = &app.confirm {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let (pid, name) = (c.pid, c.name.clone());
+                    app.status = match procs::terminate(pid) {
+                        Ok(()) => format!("stopped {name} (pid {pid})"),
+                        Err(e) => format!("could not stop {name}: {e}"),
+                    };
+                    app.confirm = None;
+                }
+                _ => {
+                    app.confirm = None;
+                    app.status = "left it running".into();
+                }
+            }
+            continue;
+        }
+
+        let rows = app.visible().len();
         match key.code {
             KeyCode::Char('q') => return Ok(()),
             KeyCode::Esc if app.expanded.is_some() => app.expanded = None,
             KeyCode::Esc => return Ok(()),
             KeyCode::Char('t') => app.by_rate = !app.by_rate,
+            // Hiding is per program name, so a restart stays hidden.
+            KeyCode::Char('h') => {
+                if let Some((_, name, _)) = app.selected() {
+                    let now_hidden = app.hidden.toggle(&name);
+                    app.status = if now_hidden {
+                        format!("hiding {name} — still recorded")
+                    } else {
+                        format!("showing {name} again")
+                    };
+                    app.table.select(Some(0));
+                }
+            }
+            KeyCode::Char('H') => {
+                app.show_hidden = !app.show_hidden;
+                app.table.select(Some(0));
+            }
+            KeyCode::Char('x') => {
+                if let Some((pid, name, path)) = app.selected() {
+                    app.confirm = Some(Confirm {
+                        pid,
+                        critical: procs::is_critical(&name),
+                        name,
+                        path,
+                    });
+                }
+            }
             KeyCode::Enter => {
                 app.expanded = match app.expanded {
                     Some(_) => None,
-                    None => app
-                        .state
-                        .ranked(app.by_rate)
-                        .get(app.table.selected().unwrap_or(0))
-                        .map(|p| p.pid),
+                    None => app.selected().map(|(pid, _, _)| pid),
                 };
             }
             KeyCode::Down | KeyCode::Char('j') => move_by(app, rows, 1),
@@ -148,12 +233,40 @@ fn draw(f: &mut Frame, app: &mut App) {
     ])
     .split(f.area());
 
-    let ranked = app.state.ranked(app.by_rate);
+    // Everything that reads the process list is done here, in one block, so
+    // the borrow ends before the table needs `&mut app.table` to scroll.
+    let (rows, shown, down, up) = {
+        let ranked = app.visible();
+        let down: f64 = ranked.iter().map(|p| p.received_rate).sum();
+        let up: f64 = ranked.iter().map(|p| p.sent_rate).sum();
+        let rows: Vec<Row> = ranked
+            .iter()
+            .map(|p| {
+                // A hidden program only appears while they are being shown,
+                // and then it should be obvious which ones they are.
+                let name = if app.hidden.is_hidden(&p.name) {
+                    Cell::from(trunc(&p.name, 26)).style(Style::new().fg(Color::DarkGray).italic())
+                } else {
+                    Cell::from(trunc(&p.name, 26))
+                };
+                Row::new(vec![
+                    name,
+                    Cell::from(Line::from(p.pid.to_string()).right_aligned()),
+                    Cell::from(Line::from(rate(p.received_rate)).right_aligned())
+                        .style(rate_style(p.received_rate)),
+                    Cell::from(Line::from(rate(p.sent_rate)).right_aligned())
+                        .style(rate_style(p.sent_rate)),
+                    Cell::from(Line::from(bytes(p.traffic.received)).right_aligned()),
+                    Cell::from(Line::from(bytes(p.traffic.sent)).right_aligned()),
+                    Cell::from(Line::from(p.peers.len().to_string()).right_aligned()),
+                ])
+            })
+            .collect();
+        (rows, ranked.len(), down, up)
+    };
     let elapsed = app.started.elapsed().as_secs();
 
     // ── title ───────────────────────────────────────────────────────────────
-    let down: f64 = ranked.iter().map(|p| p.received_rate).sum();
-    let up: f64 = ranked.iter().map(|p| p.sent_rate).sum();
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -170,14 +283,34 @@ fn draw(f: &mut Frame, app: &mut App) {
             ),
             Span::styled(
                 format!(
-                    "{} programs · {} in {}m{:02}s · sorted by {}",
-                    ranked.len(),
+                    "{} programs · {} in {}m{:02}s · by {}",
+                    shown,
                     bytes(app.state.total.total()),
                     elapsed / 60,
                     elapsed % 60,
                     if app.by_rate { "rate" } else { "total" }
                 ),
                 Style::new().fg(Color::DarkGray),
+            ),
+            // Never filter silently: a list that is quietly incomplete is
+            // worse than one that is long.
+            Span::styled(
+                if app.hidden.is_empty() {
+                    String::new()
+                } else if app.show_hidden {
+                    format!(" · {} hidden, shown", app.hidden.len())
+                } else {
+                    format!(" · {} hidden", app.hidden.len())
+                },
+                Style::new().fg(Color::Yellow),
+            ),
+            Span::styled(
+                if app.status.is_empty() {
+                    String::new()
+                } else {
+                    format!("   {}", app.status)
+                },
+                Style::new().fg(Color::Cyan),
             ),
         ])),
         chunks[0],
@@ -202,23 +335,6 @@ fn draw(f: &mut Frame, app: &mut App) {
         }),
     )
     .style(Style::new().bold().fg(Color::White));
-
-    let rows: Vec<Row> = ranked
-        .iter()
-        .map(|p| {
-            Row::new(vec![
-                Cell::from(trunc(&p.name, 26)),
-                Cell::from(Line::from(p.pid.to_string()).right_aligned()),
-                Cell::from(Line::from(rate(p.received_rate)).right_aligned())
-                    .style(rate_style(p.received_rate)),
-                Cell::from(Line::from(rate(p.sent_rate)).right_aligned())
-                    .style(rate_style(p.sent_rate)),
-                Cell::from(Line::from(bytes(p.traffic.received)).right_aligned()),
-                Cell::from(Line::from(bytes(p.traffic.sent)).right_aligned()),
-                Cell::from(Line::from(p.peers.len().to_string()).right_aligned()),
-            ])
-        })
-        .collect();
 
     let widths = [
         Constraint::Min(18),
@@ -245,8 +361,8 @@ fn draw(f: &mut Frame, app: &mut App) {
     );
 
     let visible = chunks[1].height.saturating_sub(3) as usize;
-    if ranked.len() > visible {
-        let mut sb = ScrollbarState::new(ranked.len()).position(app.table.selected().unwrap_or(0));
+    if shown > visible {
+        let mut sb = ScrollbarState::new(shown).position(app.table.selected().unwrap_or(0));
         f.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
@@ -266,9 +382,15 @@ fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(" Enter", key),
-            Span::styled(" what it is, where it talks   ", dim),
+            Span::styled(" details   ", dim),
+            Span::styled("h", key),
+            Span::styled(" hide   ", dim),
+            Span::styled("H", key),
+            Span::styled(" show hidden   ", dim),
+            Span::styled("x", key),
+            Span::styled(" stop   ", dim),
             Span::styled("t", key),
-            Span::styled(" sort by rate/total   ", dim),
+            Span::styled(" sort   ", dim),
             Span::styled("j k", key),
             Span::styled(" move   ", dim),
             Span::styled("q", key),
@@ -277,9 +399,85 @@ fn draw(f: &mut Frame, app: &mut App) {
         chunks[2],
     );
 
+    if let Some(c) = &app.confirm {
+        draw_confirm(f, c);
+    }
+
     if let Some(pid) = app.expanded {
         draw_detail(f, app, pid);
     }
+}
+
+/// The question asked before a process is killed.
+///
+/// `TerminateProcess` gives the program no chance to save anything and cannot
+/// be undone, so it gets a deliberate yes — and when the target is something
+/// Windows needs, the warning says what will actually happen rather than
+/// leaving "are you sure" to carry it.
+fn draw_confirm(f: &mut Frame, c: &Confirm) {
+    let area = f.area();
+    let w = area.width.saturating_sub(8).clamp(40, 76);
+    let h = if c.critical { 12 } else { 10 };
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h.min(area.height),
+    };
+
+    let dim = Style::new().fg(Color::DarkGray);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(c.name.clone(), Style::new().bold()),
+            Span::styled(format!("  (pid {})", c.pid), dim),
+        ]),
+        Line::styled(
+            if c.path.is_empty() {
+                "path could not be read".to_string()
+            } else {
+                c.path.clone()
+            },
+            dim,
+        ),
+        Line::raw(""),
+        Line::raw("It will be killed immediately. Anything it had not"),
+        Line::raw("saved is lost, and this cannot be undone."),
+    ];
+
+    if c.critical {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "This is a core Windows process. Stopping it will",
+            Style::new().fg(Color::Red).bold(),
+        ));
+        lines.push(Line::styled(
+            "very likely crash the machine.",
+            Style::new().fg(Color::Red).bold(),
+        ));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("  y", Style::new().fg(Color::Red).bold()),
+        Span::styled("  stop it        ", dim),
+        Span::styled("any other key", Style::new().fg(Color::Green).bold()),
+        Span::styled("  leave it alone", dim),
+    ]));
+
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(if c.critical {
+                    Color::Red
+                } else {
+                    Color::Yellow
+                }))
+                .title(" Stop this program? "),
+        ),
+        popup,
+    );
 }
 
 /// One program in full: what it says it is, where it lives, and where it has
@@ -404,6 +602,10 @@ mod tests {
     use crate::etw::{Dir, Proto};
     use std::net::{IpAddr, Ipv4Addr};
 
+    /// Distinguishes one demo App from another, so their hidden-lists do not
+    /// share a file.
+    static DEMO_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
     fn demo() -> App {
         let mut state = State::new();
         for (pid, dir, n, peer) in [
@@ -462,6 +664,17 @@ mod tests {
             table: TableState::default().with_selected(0),
             by_rate: true,
             expanded: None,
+            // A fresh file per call, not per process: the tests run in
+            // parallel in one binary, and sharing one path made whichever
+            // test hid something break whichever test counted rows.
+            hidden: Hidden::load(std::env::temp_dir().join("netwatch_tui_test").join(format!(
+                "hidden-{}-{}.txt",
+                std::process::id(),
+                DEMO_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ))),
+            show_hidden: false,
+            confirm: None,
+            status: String::new(),
             started: Instant::now(),
         }
     }
@@ -560,6 +773,137 @@ mod tests {
 
     /// The two sorts answer different questions and must not be the same list
     /// by accident.
+    /// The promise hiding makes: it changes the view and nothing else. A
+    /// filter that quietly stopped recording would turn "I did not want to
+    /// look at it" into "I have no idea what it did".
+    #[test]
+    fn hiding_changes_the_view_and_not_the_record() {
+        let mut app = demo();
+        assert_eq!(app.visible().len(), 3);
+
+        app.hidden.toggle("mystery.exe");
+        assert_eq!(app.visible().len(), 2, "one fewer on screen");
+        assert_eq!(
+            app.state.ranked(true).len(),
+            3,
+            "the record still holds all three"
+        );
+
+        // And what it measured is untouched.
+        let still = app.state.get(2628).expect("still recorded");
+        assert!(still.traffic.total() > 0);
+
+        app.hidden.clear();
+    }
+
+    #[test]
+    fn hidden_programs_can_be_brought_back() {
+        let mut app = demo();
+        app.hidden.toggle("mystery.exe");
+        app.show_hidden = true;
+
+        let text = render(&mut app, 108, 12);
+        assert!(
+            text.contains("mystery.exe"),
+            "showing hidden must show them:
+{text}"
+        );
+        assert!(
+            text.contains("1 hidden, shown"),
+            "the header must say what is going on:
+{text}"
+        );
+        app.hidden.clear();
+    }
+
+    /// A list that is quietly incomplete is worse than a long one.
+    #[test]
+    fn the_header_never_hides_that_it_is_hiding() {
+        let mut app = demo();
+        app.hidden.toggle("mystery.exe");
+        let text = render(&mut app, 108, 12);
+        assert!(
+            text.contains("1 hidden"),
+            "not stated:
+{text}"
+        );
+        assert!(
+            !text.contains("mystery.exe"),
+            "it should be out of the list:
+{text}"
+        );
+        app.hidden.clear();
+    }
+
+    #[test]
+    fn stopping_a_program_is_asked_about_first() {
+        let mut app = demo();
+        app.confirm = Some(Confirm {
+            pid: 6124,
+            name: "firefox.exe".into(),
+            path: "C:/Program Files/Mozilla Firefox/firefox.exe".into(),
+            critical: false,
+        });
+        let text = render(&mut app, 108, 16);
+        println!(
+            "
+{text}"
+        );
+
+        assert!(
+            text.contains("Stop this program?"),
+            "no question:
+{text}"
+        );
+        assert!(
+            text.contains("firefox.exe"),
+            "no name:
+{text}"
+        );
+        assert!(
+            text.contains("pid 6124"),
+            "no pid:
+{text}"
+        );
+        assert!(
+            text.contains("cannot be undone"),
+            "no warning:
+{text}"
+        );
+        assert!(
+            text.contains("leave it alone"),
+            "no way out:
+{text}"
+        );
+    }
+
+    /// "Are you sure" does not carry enough when the answer is a blue screen.
+    #[test]
+    fn a_core_windows_process_says_what_will_happen() {
+        let mut app = demo();
+        app.confirm = Some(Confirm {
+            pid: 900,
+            name: "lsass.exe".into(),
+            path: "C:/Windows/System32/lsass.exe".into(),
+            critical: crate::procs::is_critical("lsass.exe"),
+        });
+        let text = render(&mut app, 108, 18);
+        println!(
+            "
+{text}"
+        );
+        assert!(
+            text.contains("core Windows process"),
+            "the warning must name what it is:
+{text}"
+        );
+        assert!(
+            text.contains("crash the machine"),
+            "and what it will do:
+{text}"
+        );
+    }
+
     #[test]
     fn the_sort_can_be_switched() {
         let app = demo();
