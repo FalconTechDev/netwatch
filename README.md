@@ -101,7 +101,13 @@ netwatch service install
 
 That registers a scheduled task which starts at boot, under SYSTEM, before
 anyone logs in and with no window — a Run key would start it after login,
-unelevated, which is too late and not enough rights. Nothing is installed by
+unelevated, which is too late and not enough rights.
+
+The task is defined from XML rather than from `schtasks` switches, because three
+of its defaults are wrong for something meant to run forever, and all three fail
+silently: a task is killed after 72 hours, will not start while the machine is
+on battery, and stops if it goes onto battery. On a laptop that leaves a gap in
+the log exactly where the answer should be, with nothing anywhere to say why. Nothing is installed by
 merely running netwatch; this is a separate, deliberate command, because a
 program that quietly arranges to run forever on someone's machine is the
 behaviour of something else entirely. `netwatch service uninstall` removes it.
@@ -228,9 +234,29 @@ an elevated session. Without it the session refuses to start and says so.
 
 ## Install
 
+From an **elevated** PowerShell:
+
 ```powershell
 irm https://github.com/FalconTechDev/netwatch/releases/latest/download/install.ps1 | iex
 ```
+
+That installs the binary, puts it on `PATH`, **and starts recording** — at every
+boot from then on, and immediately, so there is no wait for a reboot before the
+log has anything in it.
+
+Read that second part twice: it arranges for a program to run forever on this
+machine, as SYSTEM, starting before anyone logs in. That is what a traffic
+recorder has to do in order to answer "what happened overnight", and the
+installer says so rather than doing it quietly.
+
+- `NETWATCH_NO_AUTOSTART=1` installs the binary alone
+- `netwatch service uninstall` removes the task afterwards
+- `netwatch service status` says whether it is actually running
+
+Without elevation the installer still works — binary and `PATH` — and says
+plainly that recording was **not** set up, rather than leaving you believing it
+was. netwatch needs an elevated terminal to run at all: reading which process
+sent a packet is a kernel-level question.
 
 Or from source:
 
@@ -238,8 +264,8 @@ Or from source:
 cargo build --release
 ```
 
-One binary. No driver and no runtime; the only thing it can add to your
-machine is the startup task, and only if you ask for it.
+One binary. No driver and no runtime; the only thing it adds to the machine is
+the startup task.
 
 ## Correctness
 
