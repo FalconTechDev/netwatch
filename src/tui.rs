@@ -225,6 +225,37 @@ fn rate_style(v: f64) -> Style {
     }
 }
 
+/// The last minute as a shape, in one cell.
+///
+/// Scaled to the process's own maximum rather than to the busiest program on
+/// screen: the question this answers is "what has this one been doing", and
+/// against a global scale every program but the loudest would be a flat line.
+///
+/// An idle tick draws as the lowest mark rather than as a blank, because a gap
+/// reads as missing data when it means the program was quiet.
+fn sparkline(history: &std::collections::VecDeque<f64>, width: usize) -> String {
+    const MARKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if history.is_empty() {
+        return String::new();
+    }
+    let peak = history.iter().cloned().fold(0.0_f64, f64::max);
+    let start = history.len().saturating_sub(width);
+    history
+        .iter()
+        .skip(start)
+        .map(|v| {
+            if peak <= 0.0 {
+                MARKS[0]
+            } else {
+                // The top mark is reserved for the peak itself, so the busiest
+                // moment is visible rather than tied with everything near it.
+                let idx = ((v / peak) * (MARKS.len() - 1) as f64).round() as usize;
+                MARKS[idx.min(MARKS.len() - 1)]
+            }
+        })
+        .collect()
+}
+
 fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::vertical([
         Constraint::Length(1),
@@ -252,6 +283,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                 Row::new(vec![
                     name,
                     Cell::from(Line::from(p.pid.to_string()).right_aligned()),
+                    Cell::from(sparkline(&p.history, 20)).style(Style::new().fg(Color::Cyan)),
                     Cell::from(Line::from(rate(p.received_rate)).right_aligned())
                         .style(rate_style(p.received_rate)),
                     Cell::from(Line::from(rate(p.sent_rate)).right_aligned())
@@ -321,6 +353,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         [
             "PROGRAM",
             "PID",
+            "LAST MINUTE",
             "DOWN",
             "UP",
             "TOTAL ↓",
@@ -331,7 +364,12 @@ fn draw(f: &mut Frame, app: &mut App) {
         .enumerate()
         .map(|(i, t)| {
             let line = Line::from(t);
-            Cell::from(if i >= 1 { line.right_aligned() } else { line })
+            // Columns 0 and 2 are a name and a picture; the rest are numbers.
+            Cell::from(if i == 0 || i == 2 {
+                line
+            } else {
+                line.right_aligned()
+            })
         }),
     )
     .style(Style::new().bold().fg(Color::White));
@@ -339,6 +377,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     let widths = [
         Constraint::Min(18),
         Constraint::Length(8),
+        Constraint::Length(20),
         Constraint::Length(12),
         Constraint::Length(12),
         Constraint::Length(11),
@@ -563,8 +602,21 @@ fn draw_detail(f: &mut Frame, app: &App, pid: u32) {
     let rows: Vec<Row> = peers
         .iter()
         .map(|peer| {
+            // Name and address both: the name says who it is, the address is
+            // what was actually connected to — and one name often answers
+            // with several.
+            let who = match &peer.host {
+                Some(h) => Line::from(vec![
+                    Span::raw(h.clone()),
+                    Span::styled(
+                        format!("  {}:{}", peer.addr, peer.port),
+                        Style::new().fg(Color::DarkGray),
+                    ),
+                ]),
+                None => Line::from(format!("{}:{}", peer.addr, peer.port)),
+            };
             Row::new(vec![
-                Cell::from(format!("{}:{}", peer.addr, peer.port)),
+                Cell::from(who),
                 Cell::from(Line::from(format!("{:?}", peer.proto).to_uppercase()).right_aligned()),
                 Cell::from(Line::from(bytes(peer.traffic.received)).right_aligned()),
                 Cell::from(Line::from(bytes(peer.traffic.sent)).right_aligned()),
@@ -576,7 +628,7 @@ fn draw_detail(f: &mut Frame, app: &App, pid: u32) {
         Table::new(
             rows,
             [
-                Constraint::Min(22),
+                Constraint::Min(30),
                 Constraint::Length(6),
                 Constraint::Length(11),
                 Constraint::Length(11),
@@ -584,7 +636,7 @@ fn draw_detail(f: &mut Frame, app: &App, pid: u32) {
         )
         .header(
             Row::new(vec![
-                Cell::from("PEER"),
+                Cell::from("PEER  (address)"),
                 Cell::from(Line::from("PROTO").right_aligned()),
                 Cell::from(Line::from("DOWN").right_aligned()),
                 Cell::from(Line::from("UP").right_aligned()),
@@ -616,16 +668,42 @@ mod tests {
             (4852, Dir::Sent, 4_002, [93, 184, 216, 34]),
             (2628, Dir::Sent, 4_574, [84, 17, 53, 155]),
         ] {
-            state.apply(crate::etw::Event {
+            state.apply(crate::etw::Event::Transfer(crate::etw::Transfer {
                 pid,
                 proto: Proto::Tcp,
                 dir,
                 bytes: n,
                 peer: IpAddr::V4(Ipv4Addr::from(peer)),
                 peer_port: 443,
-            });
+            }));
         }
-        state.tick(1.0);
+        // One peer the machine looked up, one it did not: both cases have to
+        // render, and the unnamed one must not be left blank.
+        state.apply(crate::etw::Event::Named {
+            addr: IpAddr::V4(Ipv4Addr::new(140, 82, 114, 25)),
+            host: "api.github.com".into(),
+        });
+
+        // A minute of history, with shapes that differ: one program ramping
+        // up, one steady, one that burst once and stopped. A single tick would
+        // draw one block and prove nothing about the drawing.
+        for i in 0..24u64 {
+            for (pid, peer, n) in [
+                (6124u32, [185, 184, 222, 3], 20_000 + i * 26_000),
+                (4852, [93, 184, 216, 34], 30_000),
+                (2628, [84, 17, 53, 155], if i == 9 { 900_000 } else { 200 }),
+            ] {
+                state.apply(crate::etw::Event::Transfer(crate::etw::Transfer {
+                    pid,
+                    proto: Proto::Tcp,
+                    dir: Dir::Received,
+                    bytes: n,
+                    peer: IpAddr::V4(Ipv4Addr::from(peer)),
+                    peer_port: 443,
+                }));
+            }
+            state.tick(1.0);
+        }
 
         // Described here rather than read off the machine the test runs on:
         // otherwise these assertions would be about whatever happened to hold
@@ -902,6 +980,45 @@ mod tests {
             "and what it will do:
 {text}"
         );
+    }
+
+    fn hist(v: &[f64]) -> std::collections::VecDeque<f64> {
+        v.iter().cloned().collect()
+    }
+
+    /// The shape is the point: a steady stream and one burst can average to
+    /// exactly the same rate, and the number cannot tell them apart.
+    #[test]
+    fn a_burst_and_a_steady_stream_look_different() {
+        let steady = sparkline(&hist(&[50.0; 8]), 8);
+        let burst = sparkline(&hist(&[0.0, 0.0, 0.0, 400.0, 0.0, 0.0, 0.0, 0.0]), 8);
+        assert_ne!(steady, burst);
+        assert!(burst.contains('█'), "the peak should stand out: {burst}");
+        assert_eq!(burst.chars().filter(|c| *c == '█').count(), 1);
+    }
+
+    /// Scaled to the process's own peak, not to the busiest program on screen:
+    /// otherwise everything but the loudest would be a flat line.
+    #[test]
+    fn each_program_is_drawn_against_its_own_peak() {
+        let small = sparkline(&hist(&[1.0, 2.0, 4.0]), 8);
+        let large = sparkline(&hist(&[1000.0, 2000.0, 4000.0]), 8);
+        assert_eq!(small, large, "the same shape at any scale");
+    }
+
+    /// An idle tick is data. Drawn as a blank it would read as missing.
+    #[test]
+    fn quiet_ticks_are_drawn_not_skipped() {
+        let s = sparkline(&hist(&[0.0, 0.0, 0.0]), 8);
+        assert_eq!(s.chars().count(), 3);
+        assert!(s.chars().all(|c| c == '▁'), "{s}");
+    }
+
+    #[test]
+    fn only_the_last_ticks_are_shown() {
+        let s = sparkline(&hist(&[9.0, 9.0, 9.0, 9.0, 9.0]), 3);
+        assert_eq!(s.chars().count(), 3);
+        assert!(sparkline(&hist(&[]), 8).is_empty());
     }
 
     #[test]

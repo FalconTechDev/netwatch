@@ -5,11 +5,11 @@
 //! are kept: totals accumulate for the life of the run, rates are the delta
 //! over the last tick and nothing more.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::time::Instant;
 
-use crate::etw::{Dir, Event, Proto};
+use crate::etw::{Dir, Event, Proto, Transfer};
 use crate::procs::{Info, Names};
 
 #[derive(Default, Clone)]
@@ -30,6 +30,10 @@ pub struct Peer {
     pub proto: Proto,
     pub traffic: Traffic,
     pub last_seen: Instant,
+    /// The name this machine asked for when it looked the address up. None
+    /// when nothing looked it up — a hard-coded address, a cached answer from
+    /// before this session, a peer reached by address on purpose.
+    pub host: Option<String>,
     /// Totals as of the last time a minute was written to the log.
     minute_base: Traffic,
 }
@@ -46,6 +50,10 @@ pub struct Process {
     pub received_rate: f64,
     pub peers: HashMap<IpAddr, Peer>,
     pub last_seen: Instant,
+    /// Total bytes per second for each of the last `HISTORY` ticks, oldest
+    /// first. A shape says something a single number cannot: a steady stream
+    /// and one large burst can average to exactly the same rate.
+    pub history: VecDeque<f64>,
     /// Totals as of the previous tick, which is what makes a rate a rate.
     previous: Traffic,
     /// Totals as of the last minute written to the log. Separate from
@@ -71,9 +79,16 @@ pub struct MinuteRow {
     pub peers: String,
 }
 
+/// How many ticks of rate history each process keeps. At one tick a second
+/// that is the last minute, which is the span over which "is it still going"
+/// is a useful question.
+pub const HISTORY: usize = 60;
+
 pub struct State {
     procs: HashMap<u32, Process>,
     names: Names,
+    /// Every address this machine has looked up, and the name it asked for.
+    hosts: HashMap<IpAddr, String>,
     pub total: Traffic,
     /// Events that arrived, whether or not they were for a process we can name.
     pub events: u64,
@@ -90,12 +105,36 @@ impl State {
         Self {
             procs: HashMap::new(),
             names: Names::new(),
+            hosts: HashMap::new(),
             total: Traffic::default(),
             events: 0,
         }
     }
 
     pub fn apply(&mut self, ev: Event) {
+        match ev {
+            Event::Transfer(t) => self.apply_transfer(t),
+            Event::Named { addr, host } => self.apply_name(addr, host),
+        }
+    }
+
+    /// Remember a lookup, and name anything already talking to that address.
+    ///
+    /// The backfill matters: a program often connects before we see the answer
+    /// — a cached lookup, or one that happened before netwatch started — and
+    /// without it those peers would stay anonymous for the whole session.
+    fn apply_name(&mut self, addr: IpAddr, host: String) {
+        for p in self.procs.values_mut() {
+            if let Some(peer) = p.peers.get_mut(&addr)
+                && peer.host.is_none()
+            {
+                peer.host = Some(host.clone());
+            }
+        }
+        self.hosts.entry(addr).or_insert(host);
+    }
+
+    fn apply_transfer(&mut self, ev: Transfer) {
         self.events += 1;
         let now = Instant::now();
 
@@ -114,17 +153,20 @@ impl State {
             received_rate: 0.0,
             peers: HashMap::new(),
             last_seen: now,
+            history: VecDeque::with_capacity(HISTORY),
             previous: Traffic::default(),
             minute_base: Traffic::default(),
         });
 
         proc.last_seen = now;
+        let known = self.hosts.get(&ev.peer).cloned();
         let peer = proc.peers.entry(ev.peer).or_insert_with(|| Peer {
             addr: ev.peer,
             port: ev.peer_port,
             proto: ev.proto,
             traffic: Traffic::default(),
             last_seen: now,
+            host: known,
             minute_base: Traffic::default(),
         });
         peer.last_seen = now;
@@ -158,6 +200,13 @@ impl State {
             p.sent_rate = (p.traffic.sent - p.previous.sent) as f64 / elapsed;
             p.received_rate = (p.traffic.received - p.previous.received) as f64 / elapsed;
             p.previous = p.traffic.clone();
+
+            // Every process gets a point every tick, including zero: a gap
+            // drawn as nothing would read as "no data" when it means "idle".
+            p.history.push_back(p.sent_rate + p.received_rate);
+            while p.history.len() > HISTORY {
+                p.history.pop_front();
+            }
         }
     }
 
@@ -218,7 +267,15 @@ impl State {
                     + (peer.traffic.received - peer.minute_base.received);
                 peer.minute_base = peer.traffic.clone();
                 if moved > 0 {
-                    peers.push((format!("{}:{}", peer.addr, peer.port), moved));
+                    // `name@addr:port` when the machine looked it up, plain
+                    // `addr:port` when it did not. The address is always there
+                    // because it is the identity; the name is what makes the
+                    // line readable a week later.
+                    let who = match &peer.host {
+                        Some(h) => format!("{h}@{}:{}", peer.addr, peer.port),
+                        None => format!("{}:{}", peer.addr, peer.port),
+                    };
+                    peers.push((who, moved));
                 }
             }
 
@@ -251,14 +308,103 @@ mod tests {
     use std::net::Ipv4Addr;
 
     fn ev(pid: u32, dir: Dir, bytes: u64, peer: [u8; 4]) -> Event {
-        Event {
+        Event::Transfer(Transfer {
             pid,
             proto: Proto::Tcp,
             dir,
             bytes,
             peer: IpAddr::V4(Ipv4Addr::from(peer)),
             peer_port: 443,
+        })
+    }
+
+    fn named(peer: [u8; 4], host: &str) -> Event {
+        Event::Named {
+            addr: IpAddr::V4(Ipv4Addr::from(peer)),
+            host: host.into(),
         }
+    }
+
+    /// A name is only worth showing if it is the one the machine asked for.
+    #[test]
+    fn a_looked_up_address_gets_its_name() {
+        let mut s = State::new();
+        s.apply(named([140, 82, 114, 25], "api.github.com"));
+        s.apply(ev(1, Dir::Received, 500, [140, 82, 114, 25]));
+
+        let p = s.get(1).unwrap();
+        let peer = &p.peers[&IpAddr::V4(Ipv4Addr::new(140, 82, 114, 25))];
+        assert_eq!(peer.host.as_deref(), Some("api.github.com"));
+        // The address is kept alongside the name, never replaced by it.
+        assert_eq!(peer.addr, IpAddr::V4(Ipv4Addr::new(140, 82, 114, 25)));
+        assert_eq!(peer.port, 443);
+    }
+
+    /// Traffic usually arrives before we see the answer — a cached lookup, or
+    /// one from before netwatch started. Without backfilling, those peers
+    /// would stay anonymous for the whole session.
+    #[test]
+    fn a_name_learned_later_still_reaches_the_peer() {
+        let mut s = State::new();
+        s.apply(ev(1, Dir::Received, 500, [93, 184, 216, 34]));
+        assert!(
+            s.get(1).unwrap().peers[&IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]
+                .host
+                .is_none()
+        );
+
+        s.apply(named([93, 184, 216, 34], "example.com"));
+        assert_eq!(
+            s.get(1).unwrap().peers[&IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]
+                .host
+                .as_deref(),
+            Some("example.com")
+        );
+    }
+
+    /// An address nobody looked up stays an address. Inventing a name for it
+    /// would be worse than leaving it bare.
+    #[test]
+    fn an_address_nobody_looked_up_stays_an_address() {
+        let mut s = State::new();
+        s.apply(ev(1, Dir::Sent, 10, [10, 0, 0, 5]));
+        let peer = &s.get(1).unwrap().peers[&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))];
+        assert!(peer.host.is_none());
+        assert_eq!(peer.addr, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)));
+    }
+
+    /// The first name wins. A later lookup that maps a different name onto the
+    /// same address must not rewrite history mid-session.
+    #[test]
+    fn the_name_that_was_asked_for_first_is_kept() {
+        let mut s = State::new();
+        s.apply(named([1, 1, 1, 1], "first.example"));
+        s.apply(named([1, 1, 1, 1], "second.example"));
+        s.apply(ev(1, Dir::Sent, 10, [1, 1, 1, 1]));
+        assert_eq!(
+            s.get(1).unwrap().peers[&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]
+                .host
+                .as_deref(),
+            Some("first.example")
+        );
+    }
+
+    /// The log line has to carry both: the address is the identity, the name is
+    /// what makes it readable a week later.
+    #[test]
+    fn the_log_keeps_the_name_and_the_address() {
+        let mut s = State::new();
+        s.apply(named([140, 82, 114, 25], "api.github.com"));
+        s.apply(ev(1, Dir::Received, 500, [140, 82, 114, 25]));
+        s.apply(ev(1, Dir::Sent, 10, [10, 0, 0, 5]));
+
+        let rows = s.take_minute(3);
+        let peers = &rows[0].peers;
+        assert!(
+            peers.contains("api.github.com@140.82.114.25:443"),
+            "{peers}"
+        );
+        assert!(peers.contains("10.0.0.5:443"), "unnamed peer kept: {peers}");
     }
 
     #[test]

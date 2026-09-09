@@ -46,9 +46,25 @@ pub enum Dir {
     Received,
 }
 
+/// Anything the kernel told us, in the order it said it.
+///
+/// Names and transfers share one channel deliberately: a DNS answer arrives
+/// before the traffic that follows it, and one ordered stream keeps it that
+/// way. Two channels would race, and a peer would be named a moment after it
+/// first appeared on screen.
+#[derive(Clone, Debug)]
+pub enum Event {
+    Transfer(Transfer),
+    /// An address the machine looked up, and the name it asked for.
+    Named {
+        addr: IpAddr,
+        host: String,
+    },
+}
+
 /// One send or receive, as the kernel reported it.
 #[derive(Clone, Copy, Debug)]
-pub struct Event {
+pub struct Transfer {
     pub pid: u32,
     pub proto: Proto,
     pub dir: Dir,
@@ -77,7 +93,7 @@ fn classify(opcode: u8) -> Option<(Proto, Dir)> {
     }
 }
 
-fn decode(record: &EventRecord, locator: &SchemaLocator) -> Option<Event> {
+fn decode(record: &EventRecord, locator: &SchemaLocator) -> Option<Transfer> {
     let (proto, dir) = classify(record.opcode())?;
     let schema = locator.event_schema(record).ok()?;
     let parser = Parser::create(record, &schema);
@@ -95,7 +111,7 @@ fn decode(record: &EventRecord, locator: &SchemaLocator) -> Option<Event> {
     let peer: IpAddr = parser.try_parse(addr_field).ok()?;
     let peer_port: u16 = parser.try_parse(port_field).unwrap_or(0);
 
-    Some(Event {
+    Some(Transfer {
         pid,
         proto,
         dir,
@@ -103,6 +119,39 @@ fn decode(record: &EventRecord, locator: &SchemaLocator) -> Option<Event> {
         peer,
         peer_port,
     })
+}
+
+/// A completed DNS lookup: one name, and every address it answered with.
+fn decode_dns(record: &EventRecord, locator: &SchemaLocator) -> Vec<Event> {
+    if record.event_id() != crate::dns::EVENT_QUERY_COMPLETE {
+        return Vec::new();
+    }
+    let Ok(schema) = locator.event_schema(record) else {
+        return Vec::new();
+    };
+    let parser = Parser::create(record, &schema);
+
+    // A non-zero status is a lookup that failed; its results are empty and
+    // recording the name against nothing would teach us nothing.
+    let status: u32 = parser.try_parse("QueryStatus").unwrap_or(1);
+    if status != 0 {
+        return Vec::new();
+    }
+    let Ok(name) = parser.try_parse::<String>("QueryName") else {
+        return Vec::new();
+    };
+    if !crate::dns::is_plausible_name(&name) {
+        return Vec::new();
+    }
+    let results: String = parser.try_parse("QueryResults").unwrap_or_default();
+
+    crate::dns::addresses(&results)
+        .into_iter()
+        .map(|addr| Event::Named {
+            addr,
+            host: name.clone(),
+        })
+        .collect()
 }
 
 /// Start listening. Events arrive on the channel until the returned trace is
@@ -117,9 +166,20 @@ pub fn start(tx: Sender<Event>) -> Result<UserTrace, String> {
     // clear — so it is deliberately not an error.
     let _ = stop_trace_by_name(SESSION);
 
-    let provider = Provider::by_guid(KERNEL_NETWORK)
+    let traffic_tx = tx.clone();
+    let traffic = Provider::by_guid(KERNEL_NETWORK)
         .add_callback(move |record: &EventRecord, locator: &SchemaLocator| {
-            if let Some(ev) = decode(record, locator) {
+            if let Some(t) = decode(record, locator) {
+                let _ = traffic_tx.send(Event::Transfer(t));
+            }
+        })
+        .build();
+
+    // The second provider on the same session: one session, one ordered
+    // stream, and one thing to clean up if this process is killed.
+    let names = Provider::by_guid(crate::dns::DNS_CLIENT)
+        .add_callback(move |record: &EventRecord, locator: &SchemaLocator| {
+            for ev in decode_dns(record, locator) {
                 let _ = tx.send(ev);
             }
         })
@@ -127,7 +187,8 @@ pub fn start(tx: Sender<Event>) -> Result<UserTrace, String> {
 
     UserTrace::new()
         .named(SESSION.to_string())
-        .enable(provider)
+        .enable(traffic)
+        .enable(names)
         .start_and_process()
         .map_err(|e| {
             format!(

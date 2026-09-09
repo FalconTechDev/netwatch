@@ -5,6 +5,7 @@
 //! properly are paid. The answer is available: the kernel reports every
 //! transfer against the process that caused it, and this reads that.
 
+mod dns;
 mod etw;
 mod hidden;
 mod log;

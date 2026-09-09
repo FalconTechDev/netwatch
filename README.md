@@ -33,15 +33,20 @@ one, `x` to stop one, `q` to quit.
 ## What it looks like
 
 ```
- netwatch  ↓ 863.6 KB/s  ↑ 94.4 KB/s   3 programs · 958.1 KB in 0m42s · sorted by rate
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│ PROGRAM                      PID         DOWN           UP     TOTAL ↓   TOTAL ↑  PEERS│
-│▌firefox.exe                 6124   831.2 KB/s    86.1 KB/s    831.2 KB   86.1 KB      2│
-│ backup-agent.exe            4852    32.4 KB/s     3.9 KB/s     32.4 KB    3.9 KB      1│
-│ telemetry.exe               2628            —     4.5 KB/s         0 B    4.5 KB      1│
-└────────────────────────────────────────────────────────────────────────────────────────┘
- Enter who it talks to   t sort by rate/total   j k move   q quit
+ netwatch  ↓ 633.0 KB/s  ↑ 94.4 KB/s   3 programs · 9.8 MB in 4m12s · by rate
+┌────────────────────────────────────────────────────────────────────────────────────────────┐
+│ PROGRAM                 PID LAST MINUTE                 DOWN           UP   TOTAL ↓  PEERS │
+│▌firefox.exe            6124 ▂▂▂▂▃▃▃▃▃▄▄▄▄▄▅▅▅▅▅   603.5 KB/s    86.1 KB/s    8.1 MB      2 │
+│ backup-agent.exe       4852 ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄    29.3 KB/s     3.9 KB/s  735.5 KB      1 │
+│ mystery.exe            2628 ▁▁▁▁▁█▁▁▁▁▁▁▁▁▁▁▁▁▁      200 B/s            —  883.4 KB      1 │
+└────────────────────────────────────────────────────────────────────────────────────────────┘
+ Enter details   h hide   H show hidden   x stop   t sort   j k move   q quit
 ```
+
+The shape in `LAST MINUTE` says what a number cannot: `firefox` is ramping up,
+`backup-agent` has been steady, and `mystery.exe` sent one burst and went quiet.
+All three could report the same average. Each is drawn against its own peak, so
+a small program is not flattened by a loud one.
 
 `Enter` opens what one program actually is, and where it has been talking:
 
@@ -52,9 +57,9 @@ one, `x` to stop one, `q` to quit.
 │path      C:\Program Files\Mozilla Firefox\firefox.exe                    │
 │traffic   831.2 KB down · 86.1 KB up · pid 6124 · 2 peers                 │
 │                                                                          │
-│PEER                                       PROTO        DOWN          UP  │
-│185.184.222.3:443                            TCP    626.2 KB     86.1 KB  │
-│140.82.114.25:443                            TCP    205.1 KB         0 B  │
+│PEER  (address)                            PROTO        DOWN          UP  │
+│api.github.com  140.82.121.5:443             TCP    626.2 KB     86.1 KB  │
+│185.184.222.3:443                            TCP    205.1 KB         0 B  │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -70,6 +75,15 @@ absence is shown as an absence rather than as a blank line:
 │path      C:\Users\you\AppData\Local\Temp\mystery.exe                     │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
+
+Peers carry the name **this machine asked for**, next to the address it got.
+Not a reverse lookup — that invents a name the traffic never mentioned, and for
+anything behind a CDN returns something like
+`ec2-52-216-18-11.compute-1.amazonaws.com`, which is worse than the address it
+replaced. netwatch reads the machine's own DNS answers instead, so a name on
+screen is one a program here actually resolved. An address nobody looked up —
+hard-coded, or cached from before netwatch started — stays an address, which is
+the honest outcome.
 
 None of that is a verdict. The description and the publisher are strings the
 file claims about itself and nothing verifies them; a familiar path is a
@@ -258,7 +272,7 @@ cargo test
 |---|---|
 | Windows only | The provider this reads is a Windows kernel provider; there is no equivalent to fall back to |
 | Needs Administrator | A real-time ETW session cannot be opened without it |
-| Peers are addresses, not names | The transfer events carry no hostname, and attaching one by reverse lookup would name something the traffic never mentioned |
+| Only looked-up names are shown | A peer is named when this machine resolved it. Hard-coded addresses, and answers cached before netwatch started, stay addresses |
 | The record starts when you install it | netwatch cannot report on traffic from before it was recording — there is nothing kept anywhere else to read |
 | Times are UTC | The log and the reports use one clock, so a time printed matches a time in the file, wherever the file is read |
 | Loopback traffic is included | Two programs on this machine talking to each other counts as traffic, because to the kernel it is |
@@ -266,11 +280,9 @@ cargo test
 ## Roadmap
 
 1. Alerts — a threshold per program, and a note when one crosses it.
-2. Hostnames, taken from the machine's own DNS activity rather than from reverse
-   lookups, so a name shown is a name that was actually asked for.
-3. Per-program history over time, drawn.
-4. A report that compares today against the usual, so "unusual" needs no
-   threshold to be set by hand.
+2. A report that compares today against the usual, so "unusual" needs no
+   threshold set by hand.
+3. History drawn over hours, not just the last minute.
 
 ## License
 
