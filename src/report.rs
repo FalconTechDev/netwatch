@@ -6,7 +6,7 @@
 //! to have been running at the time, which is what `netwatch service install`
 //! arranges.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use crate::log::{self, Row};
@@ -27,6 +27,15 @@ struct Total {
     /// The minute it moved the most, and how much.
     peak_minute: u64,
     peak_bytes: u64,
+    /// The first and last minute it was seen moving anything. Two numbers that
+    /// answer "when did this happen" far better than a total does — "38 GB"
+    /// and "38 GB between 03:12 and 04:58" are different facts.
+    first_minute: u64,
+    last_minute: u64,
+    /// Every process id that ran under this name. More than one means it was
+    /// restarted, which is worth knowing before wondering why the total is
+    /// larger than any single run could explain.
+    pids: BTreeSet<u32>,
 }
 
 impl Total {
@@ -75,6 +84,9 @@ fn summarise(rows: &[Row]) -> HashMap<String, Total> {
             active_minutes: 0,
             peak_minute: r.minute,
             peak_bytes: 0,
+            first_minute: r.minute,
+            last_minute: r.minute,
+            pids: BTreeSet::new(),
         });
         e.sent += r.sent;
         e.received += r.received;
@@ -83,6 +95,9 @@ fn summarise(rows: &[Row]) -> HashMap<String, Total> {
         if e.path.is_empty() && !r.path.is_empty() {
             e.path = r.path.clone();
         }
+        e.pids.insert(r.pid);
+        e.first_minute = e.first_minute.min(r.minute);
+        e.last_minute = e.last_minute.max(r.minute);
         *per_minute.entry((r.name.clone(), r.minute)).or_insert(0) += r.total();
     }
 
@@ -131,19 +146,25 @@ fn everything(rows: &[Row], hours: u64, top: usize) {
     );
 
     println!(
-        "{:<26} {:>11} {:>11} {:>11} {:>8}  BUSIEST MINUTE",
-        "PROGRAM", "DOWN", "UP", "TOTAL", "ACTIVE"
+        "{:<24} {:>11} {:>11} {:>11} {:>5} {:>7}  WHEN",
+        "PROGRAM", "DOWN", "UP", "TOTAL", "SHARE", "ACTIVE"
     );
     for t in totals.iter().take(top) {
+        let share = if grand > 0 {
+            100.0 * t.total() as f64 / grand as f64
+        } else {
+            0.0
+        };
         println!(
-            "{:<26} {:>11} {:>11} {:>11} {:>7}m  {} ({})",
-            trunc(&t.name, 25),
+            "{:<24} {:>11} {:>11} {:>11} {:>4.0}% {:>6}m  {} → {}",
+            trunc(&t.name, 23),
             bytes(t.received),
             bytes(t.sent),
             bytes(t.total()),
+            share,
             t.active_minutes,
-            clock(t.peak_minute),
-            bytes(t.peak_bytes)
+            clock(t.first_minute),
+            clock(t.last_minute)
         );
         // Only when it is not the ordinary place for it: a line per program
         // doubles the table, and `C:\Windows\System32` under every Windows
@@ -187,11 +208,46 @@ fn one_program(rows: &[Row], name: &str, hours: u64) {
 
     let sent: u64 = mine.iter().map(|r| r.sent).sum();
     let received: u64 = mine.iter().map(|r| r.received).sum();
+    let first = mine.iter().map(|r| r.minute).min().unwrap_or(0);
+    let last = mine.iter().map(|r| r.minute).max().unwrap_or(0);
+    let pids: BTreeSet<u32> = mine.iter().map(|r| r.pid).collect();
+    let peak = mine.iter().map(|r| r.total()).max().unwrap_or(0);
+
     println!(
-        "{name} — last {hours} h: {} down, {} up, over {} minutes",
+        "{name} — last {hours} h: {} down, {} up",
         bytes(received),
         bytes(sent),
-        mine.len()
+    );
+    // Minutes, not rows: two processes of one program in the same minute are
+    // two rows and one minute, and counting rows would report a program as
+    // busier for longer than it ever was.
+    let minutes: BTreeSet<u64> = mine.iter().map(|r| r.minute).collect();
+    println!(
+        "  active   {} minutes, {} → {} UTC",
+        minutes.len(),
+        clock(first),
+        clock(last)
+    );
+    // A minute's worth divided by sixty seconds: the rate it actually reached,
+    // which is what a link being saturated looks like.
+    println!(
+        "  peak     {} in one minute  ({}/s)",
+        bytes(peak),
+        bytes(peak / 60)
+    );
+    // More than one pid means it was restarted during the period, which
+    // explains a total no single run could account for.
+    let shown: Vec<String> = pids.iter().take(6).map(|p| p.to_string()).collect();
+    println!(
+        "  pid      {}{}",
+        shown.join(", "),
+        if pids.len() > shown.len() {
+            format!(" … {} in all — it restarted", pids.len())
+        } else if pids.len() > 1 {
+            " — it restarted".to_string()
+        } else {
+            String::new()
+        }
     );
 
     // Where it ran from. The process is long gone by report time, so the log
@@ -283,8 +339,50 @@ mod tests {
         assert_eq!(s["a.exe"].active_minutes, 2);
     }
 
+    /// The same rule as the summary, in the per-program view: two processes of
+    /// one program in a minute are two rows and one minute. Counting rows
+    /// reports it as busy for twice as long as it was.
+    #[test]
+    fn the_detail_view_counts_minutes_not_rows() {
+        let rows = [
+            row(100, 1, "a.exe", 10, 0, ""),
+            row(100, 2, "a.exe", 10, 0, ""),
+            row(101, 1, "a.exe", 10, 0, ""),
+        ];
+        let minutes: BTreeSet<u64> = rows.iter().map(|r| r.minute).collect();
+        assert_eq!(minutes.len(), 2);
+        assert_eq!(rows.len(), 3, "three rows, two minutes");
+    }
+
     /// The peak is what turns "40 GB overnight" into "40 GB at 03:12", which
     /// is the part that identifies what happened.
+    /// More than one pid under a name means it restarted, and that explains a
+    /// total no single run could account for.
+    #[test]
+    fn restarts_are_visible_as_several_pids() {
+        let rows = vec![
+            row(100, 7, "backup.exe", 1_000, 0, ""),
+            row(200, 999, "backup.exe", 2_000, 0, ""),
+        ];
+        let s = summarise(&rows);
+        assert_eq!(s["backup.exe"].pids.len(), 2);
+        assert!(s["backup.exe"].pids.contains(&999));
+    }
+
+    /// When it happened is a different fact from how much, and usually the
+    /// more useful one.
+    #[test]
+    fn the_window_it_was_active_in_is_kept() {
+        let rows = vec![
+            row(500, 1, "a.exe", 10, 0, ""),
+            row(100, 1, "a.exe", 10, 0, ""),
+            row(300, 1, "a.exe", 10, 0, ""),
+        ];
+        let s = summarise(&rows);
+        assert_eq!(s["a.exe"].first_minute, 100, "earliest, whatever the order");
+        assert_eq!(s["a.exe"].last_minute, 500);
+    }
+
     #[test]
     fn the_busiest_minute_is_found() {
         let rows = vec![

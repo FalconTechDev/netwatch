@@ -49,6 +49,10 @@ pub struct Process {
     pub sent_rate: f64,
     pub received_rate: f64,
     pub peers: HashMap<IpAddr, Peer>,
+    /// When netwatch first saw this process move anything. Not when the
+    /// process started — netwatch cannot know that about something already
+    /// running — which is why the screen says "seen" rather than "running".
+    pub first_seen: Instant,
     pub last_seen: Instant,
     /// Total bytes per second for each of the last `HISTORY` ticks, oldest
     /// first. A shape says something a single number cannot: a steady stream
@@ -152,6 +156,7 @@ impl State {
             sent_rate: 0.0,
             received_rate: 0.0,
             peers: HashMap::new(),
+            first_seen: now,
             last_seen: now,
             history: VecDeque::with_capacity(HISTORY),
             previous: Traffic::default(),

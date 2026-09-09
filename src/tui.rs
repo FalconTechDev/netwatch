@@ -447,6 +447,20 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
+/// A duration as a person would say it. Seconds below a minute, then minutes,
+/// then hours — one unit, because "1h 4m 12s" is read as a number rather than
+/// as a length of time.
+fn ago(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3_600 {
+        format!("{}m", s / 60)
+    } else {
+        format!("{}h{:02}m", s / 3_600, (s % 3_600) / 60)
+    }
+}
+
 /// The question asked before a process is killed.
 ///
 /// `TerminateProcess` gives the program no chance to save anything and cannot
@@ -532,7 +546,7 @@ fn draw_detail(f: &mut Frame, app: &App, pid: u32) {
 
     let area = f.area();
     let w = area.width.saturating_sub(6).clamp(40, 100);
-    let h = area.height.saturating_sub(4).clamp(10, 26);
+    let h = area.height.saturating_sub(4).clamp(12, 26);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
@@ -559,7 +573,11 @@ fn draw_detail(f: &mut Frame, app: &App, pid: u32) {
         vertical: 1,
         horizontal: 1,
     });
-    let parts = Layout::vertical([Constraint::Length(5), Constraint::Min(1)]).split(inner);
+    // One row per field, plus the blank line before the peers. Sized from the
+    // field list rather than guessed: adding a field and forgetting this is
+    // how the last one silently disappeared.
+    const FIELDS: u16 = 6;
+    let parts = Layout::vertical([Constraint::Length(FIELDS + 1), Constraint::Min(1)]).split(inner);
 
     let dim = Style::new().fg(Color::DarkGray);
     let unknown = Style::new().fg(Color::Yellow);
@@ -588,6 +606,27 @@ fn draw_detail(f: &mut Frame, app: &App, pid: u32) {
                 "no publisher named in the file",
             ),
             field("path", &p.info.path, "could not be read"),
+            Line::from(vec![
+                Span::styled(format!("{:<10}", "seen"), dim),
+                Span::raw(format!(
+                    "{} ago, first {} into this run",
+                    ago(p.last_seen.elapsed()),
+                    ago(p.first_seen.duration_since(app.started))
+                )),
+            ]),
+            Line::from(vec![
+                Span::styled(format!("{:<10}", "protocol"), dim),
+                Span::raw({
+                    let mut kinds: Vec<String> = p
+                        .peers
+                        .values()
+                        .map(|peer| format!("{:?}", peer.proto).to_uppercase())
+                        .collect();
+                    kinds.sort();
+                    kinds.dedup();
+                    kinds.join(", ")
+                }),
+            ]),
             Line::from(vec![
                 Span::styled(format!("{:<10}", "traffic"), dim),
                 Span::styled(bytes(p.traffic.received), Style::new().fg(Color::Green)),
@@ -825,6 +864,17 @@ mod tests {
             "publisher missing:\n{text}"
         );
         assert!(text.contains("firefox.exe"), "path missing:\n{text}");
+
+        // The rest of what identifies a program in the moment. The traffic
+        // line is asserted because it was the one that silently fell off the
+        // bottom when two fields were added above it.
+        assert!(text.contains("seen"), "no first-seen line:\n{text}");
+        assert!(text.contains("protocol"), "no protocol line:\n{text}");
+        assert!(text.contains("TCP"), "protocol not named:\n{text}");
+        assert!(
+            text.contains("pid 6124"),
+            "the traffic line went missing:\n{text}"
+        );
     }
 
     /// A file that claims nothing about itself is the interesting case, and an
