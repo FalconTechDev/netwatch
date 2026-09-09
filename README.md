@@ -96,8 +96,7 @@ WHERE THE BULK WENT                                 BYTES
 
 ### The log
 
-Tab-separated text, one file a day, in `C:\ProgramData
-etwatch`. One line per
+Tab-separated text, one file a day, in `C:\ProgramData\netwatch`. One line per
 minute per program, with the busiest three destinations of that minute.
 
 That format is a decision, not a shortcut: it can be read by anything, tailed
@@ -151,7 +150,8 @@ Or from source:
 cargo build --release
 ```
 
-One binary. No driver, no service, no runtime.
+One binary. No driver and no runtime; the only thing it can add to your
+machine is the startup task, and only if you ask for it.
 
 ## Correctness
 
