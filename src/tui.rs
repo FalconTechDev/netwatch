@@ -447,6 +447,18 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
+/// Which protocols a program is actually speaking, deduplicated.
+fn protocols(p: &Process) -> String {
+    let mut kinds: Vec<String> = p
+        .peers
+        .values()
+        .map(|peer| format!("{:?}", peer.proto).to_uppercase())
+        .collect();
+    kinds.sort();
+    kinds.dedup();
+    kinds.join("/")
+}
+
 /// A duration as a person would say it. Seconds below a minute, then minutes,
 /// then hours — one unit, because "1h 4m 12s" is read as a number rather than
 /// as a length of time.
@@ -595,6 +607,15 @@ fn draw_detail(f: &mut Frame, app: &App, pid: u32) {
 
     f.render_widget(
         Paragraph::new(vec![
+            // Identity first, and the pid at the top of it: it is what every
+            // other tool on the machine wants in order to talk about this
+            // program, and it should not have to be found in the middle of a
+            // line of byte counts.
+            Line::from(vec![
+                Span::styled(format!("{:<10}", "pid"), dim),
+                Span::styled(p.pid.to_string(), Style::new().bold()),
+                Span::styled(format!("   {} peers, {}", peers.len(), protocols(p)), dim),
+            ]),
             field(
                 "described",
                 &p.info.description,
@@ -615,24 +636,11 @@ fn draw_detail(f: &mut Frame, app: &App, pid: u32) {
                 )),
             ]),
             Line::from(vec![
-                Span::styled(format!("{:<10}", "protocol"), dim),
-                Span::raw({
-                    let mut kinds: Vec<String> = p
-                        .peers
-                        .values()
-                        .map(|peer| format!("{:?}", peer.proto).to_uppercase())
-                        .collect();
-                    kinds.sort();
-                    kinds.dedup();
-                    kinds.join(", ")
-                }),
-            ]),
-            Line::from(vec![
                 Span::styled(format!("{:<10}", "traffic"), dim),
                 Span::styled(bytes(p.traffic.received), Style::new().fg(Color::Green)),
                 Span::styled(" down · ", dim),
                 Span::styled(bytes(p.traffic.sent), Style::new().fg(Color::Blue)),
-                Span::styled(format!(" up · pid {} · {} peers", p.pid, peers.len()), dim),
+                Span::styled(" up", dim),
             ]),
         ]),
         parts[0],
@@ -869,10 +877,19 @@ mod tests {
         // line is asserted because it was the one that silently fell off the
         // bottom when two fields were added above it.
         assert!(text.contains("seen"), "no first-seen line:\n{text}");
-        assert!(text.contains("protocol"), "no protocol line:\n{text}");
         assert!(text.contains("TCP"), "protocol not named:\n{text}");
+
+        // The pid gets a line of its own, at the top. Buried in the middle of
+        // a line of byte counts it was missed entirely by the first person to
+        // look at this screen.
+        let pid_line = text.lines().find(|l| l.contains("pid")).unwrap_or_default();
         assert!(
-            text.contains("pid 6124"),
+            pid_line.contains("6124"),
+            "pid is not on its own line:\n{text}"
+        );
+
+        assert!(
+            text.contains("8.1 MB down"),
             "the traffic line went missing:\n{text}"
         );
     }
