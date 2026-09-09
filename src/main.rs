@@ -6,7 +6,10 @@
 //! transfer against the process that caused it, and this reads that.
 
 mod etw;
+mod log;
 mod procs;
+mod report;
+mod service;
 mod state;
 mod tui;
 
@@ -32,6 +35,34 @@ struct Cli {
 enum Cmd {
     /// Watch live, in a full-screen view. The default.
     Live,
+    /// Record to disk, forever. What the background service runs.
+    Record {
+        /// Where the log lives. Defaults to ProgramData\\netwatch.
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+        /// Delete day files older than this.
+        #[arg(long, default_value_t = 30)]
+        keep_days: u64,
+    },
+    /// What the record says: who used the connection, and when.
+    Report {
+        /// How far back to look.
+        #[arg(long, default_value_t = 24)]
+        hours: u64,
+        /// One program in detail, with where its traffic went.
+        #[arg(long)]
+        program: Option<String>,
+        /// How many programs to list.
+        #[arg(long, default_value_t = 15)]
+        top: usize,
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
+    /// Start recording at boot, or stop doing so.
+    Service {
+        #[command(subcommand)]
+        action: service::Action,
+    },
     /// Watch for a fixed time, then print what happened and exit.
     Top {
         /// How long to watch.
@@ -47,6 +78,14 @@ fn main() -> Result<(), String> {
     match Cli::parse().cmd.unwrap_or(Cmd::Live) {
         Cmd::Live => tui::run(),
         Cmd::Top { seconds, by_total } => top(seconds, by_total),
+        Cmd::Record { dir, keep_days } => record(dir.unwrap_or_else(log::default_dir), keep_days),
+        Cmd::Report {
+            hours,
+            program,
+            top,
+            dir,
+        } => report::run(&dir.unwrap_or_else(log::default_dir), hours, program, top),
+        Cmd::Service { action } => service::run(action),
     }
 }
 
@@ -108,6 +147,60 @@ fn top(seconds: u64, by_total: bool) -> Result<(), String> {
         st.events
     );
     Ok(())
+}
+
+/// Record until stopped. This is the mode that answers the question netwatch
+/// exists for — what was downloading while nobody was watching — and it is the
+/// only mode that can, because it is the only one running at the time.
+fn record(dir: std::path::PathBuf, keep_days: u64) -> Result<(), String> {
+    let (tx, rx) = mpsc::channel();
+    let _trace = etw::start(tx)?;
+
+    let mut st = State::new();
+    let mut writer = log::Writer::new(dir.clone());
+    let mut last_minute = log::now_secs() / 60;
+    let mut last_prune_day = 0u64;
+
+    eprintln!("netwatch is recording to {}", dir.display());
+
+    loop {
+        // Drain without blocking, so a burst of traffic cannot make the writer
+        // fall behind the kernel's buffers.
+        while let Ok(ev) = rx.try_recv() {
+            st.apply(ev);
+        }
+
+        let now = log::now_secs();
+        let minute = now / 60;
+        if minute > last_minute {
+            let rows: Vec<log::Row> = st
+                .take_minute(3)
+                .into_iter()
+                .map(|r| log::Row {
+                    // Stamped with the minute that just ended, not the one
+                    // starting, so a row is filed under the time it describes.
+                    minute: last_minute,
+                    pid: r.pid,
+                    name: r.name,
+                    sent: r.sent,
+                    received: r.received,
+                    peers: r.peers,
+                })
+                .collect();
+            if let Err(e) = writer.append(last_minute * 60, &rows) {
+                eprintln!("could not write the log: {e}");
+            }
+            last_minute = minute;
+
+            let day = now / 86_400;
+            if day != last_prune_day {
+                last_prune_day = day;
+                log::prune(&dir, keep_days, now);
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// Byte counts are compared, not read digit by digit.

@@ -30,6 +30,8 @@ pub struct Peer {
     pub proto: Proto,
     pub traffic: Traffic,
     pub last_seen: Instant,
+    /// Totals as of the last time a minute was written to the log.
+    minute_base: Traffic,
 }
 
 pub struct Process {
@@ -43,12 +45,26 @@ pub struct Process {
     pub last_seen: Instant,
     /// Totals as of the previous tick, which is what makes a rate a rate.
     previous: Traffic,
+    /// Totals as of the last minute written to the log. Separate from
+    /// `previous` on purpose: the screen's tick and the log's minute are
+    /// different clocks, and sharing one baseline would make each steal the
+    /// other's bytes.
+    minute_base: Traffic,
 }
 
 impl Process {
     pub fn rate(&self) -> f64 {
         self.sent_rate + self.received_rate
     }
+}
+
+/// One process's traffic over one minute, ready for the log.
+pub struct MinuteRow {
+    pub pid: u32,
+    pub name: String,
+    pub sent: u64,
+    pub received: u64,
+    pub peers: String,
 }
 
 pub struct State {
@@ -94,6 +110,7 @@ impl State {
             peers: HashMap::new(),
             last_seen: now,
             previous: Traffic::default(),
+            minute_base: Traffic::default(),
         });
 
         proc.last_seen = now;
@@ -103,6 +120,7 @@ impl State {
             proto: ev.proto,
             traffic: Traffic::default(),
             last_seen: now,
+            minute_base: Traffic::default(),
         });
         peer.last_seen = now;
         // A peer's port is whatever it was last talking on; for a server that
@@ -161,6 +179,52 @@ impl State {
 
     pub fn get(&self, pid: u32) -> Option<&Process> {
         self.procs.get(&pid)
+    }
+
+    /// What moved since this was last called, per process, resetting the
+    /// baseline as it goes. This is what the log records: a minute's traffic
+    /// rather than a running total, so a reader can add up any span they like.
+    ///
+    /// `top_peers` bounds how many destinations each line names — one chatty
+    /// program must not be able to make a log line unbounded.
+    pub fn take_minute(&mut self, top_peers: usize) -> Vec<MinuteRow> {
+        let mut out = Vec::new();
+        for p in self.procs.values_mut() {
+            let sent = p.traffic.sent - p.minute_base.sent;
+            let received = p.traffic.received - p.minute_base.received;
+            p.minute_base = p.traffic.clone();
+
+            // Peer baselines move whether or not the process is reported, so a
+            // quiet minute cannot leave stale bytes to be counted later.
+            let mut peers: Vec<(String, u64)> = Vec::new();
+            for peer in p.peers.values_mut() {
+                let moved = (peer.traffic.sent - peer.minute_base.sent)
+                    + (peer.traffic.received - peer.minute_base.received);
+                peer.minute_base = peer.traffic.clone();
+                if moved > 0 {
+                    peers.push((format!("{}:{}", peer.addr, peer.port), moved));
+                }
+            }
+
+            if sent == 0 && received == 0 {
+                continue;
+            }
+            peers.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
+            peers.truncate(top_peers);
+            out.push(MinuteRow {
+                pid: p.pid,
+                name: p.name.clone(),
+                sent,
+                received,
+                peers: peers
+                    .iter()
+                    .map(|(a, b)| format!("{a}={b}"))
+                    .collect::<Vec<_>>()
+                    .join(";"),
+            });
+        }
+        out.sort_by_key(|r| std::cmp::Reverse(r.sent + r.received));
+        out
     }
 }
 

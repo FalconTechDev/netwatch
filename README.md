@@ -22,8 +22,9 @@ with the process that caused it and the byte count already attached. netwatch
 reads that, and nothing else.
 
 ```
-netwatch          # live, full screen
-netwatch top      # watch for ten seconds, print what happened, exit
+netwatch                    # live, full screen
+netwatch service install    # record from every boot, in the background
+netwatch report --hours 12  # what used the connection while you were away
 ```
 
 ## What it looks like
@@ -48,6 +49,62 @@ netwatch top      # watch for ten seconds, print what happened, exit
 │140.82.114.25:443                   TCP    205.1 KB           0 B │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+## What was downloading while you slept
+
+A live view can only tell you about the time you spent looking at it, which is
+never the time you want to ask about. So netwatch records.
+
+```
+netwatch service install
+```
+
+That registers a scheduled task which starts at boot, under SYSTEM, before
+anyone logs in and with no window — a Run key would start it after login,
+unelevated, which is too late and not enough rights. Nothing is installed by
+merely running netwatch; this is a separate, deliberate command, because a
+program that quietly arranges to run forever on someone's machine is the
+behaviour of something else entirely. `netwatch service uninstall` removes it.
+
+From then on:
+
+```
+$ netwatch report --hours 12
+Last 12 h — 41.7 GB moved by 23 programs, 09-08 22:14 to 09-09 10:02 UTC
+
+PROGRAM                           DOWN          UP       TOTAL   ACTIVE  BUSIEST MINUTE
+backup-agent.exe               38.2 GB    412.0 MB     38.6 GB     184m  09-09 03:12 (2.1 GB)
+firefox.exe                     2.1 GB    140.2 MB      2.2 GB      47m  09-08 23:40 (410.2 MB)
+telemetry.exe                  12.0 MB    881.4 MB    893.4 MB     712m  09-09 04:00 (14.1 MB)
+```
+
+`ACTIVE` is how many minutes it moved anything, which is what separates one big
+transfer from a steady trickle — 184 minutes of backup is a backup, 712 minutes
+of telemetry is something else. `BUSIEST MINUTE` turns "38 GB overnight" into
+"38 GB starting at 03:12", which is the part that identifies what happened.
+
+Then one program in detail, with where it went:
+
+```
+$ netwatch report --program backup-agent --hours 12
+backup-agent.exe — last 12 h: 38.2 GB down, 412.0 MB up, over 184 minutes
+
+WHERE THE BULK WENT                                 BYTES
+52.216.18.11:443                                   31.4 GB
+52.216.140.99:443                                   7.2 GB
+```
+
+### The log
+
+Tab-separated text, one file a day, in `C:\ProgramData
+etwatch`. One line per
+minute per program, with the busiest three destinations of that minute.
+
+That format is a decision, not a shortcut: it can be read by anything, tailed
+while it is being written, and inspected with a text editor. A binary format
+would be smaller and would make a year of your own data hostage to this program
+still existing and still being able to parse it. Files older than thirty days
+are deleted — `--keep-days` changes that.
 
 ## Rates and totals are different questions
 
@@ -128,17 +185,18 @@ cargo test
 | Windows only | The provider this reads is a Windows kernel provider; there is no equivalent to fall back to |
 | Needs Administrator | A real-time ETW session cannot be opened without it |
 | Peers are addresses, not names | The transfer events carry no hostname, and attaching one by reverse lookup would name something the traffic never mentioned |
-| Nothing is kept between runs | Totals start at zero each time, so "what happened overnight" needs the process to have been running overnight |
+| The record starts when you install it | netwatch cannot report on traffic from before it was recording — there is nothing kept anywhere else to read |
+| Times are UTC | The log and the reports use one clock, so a time printed matches a time in the file, wherever the file is read |
 | Loopback traffic is included | Two programs on this machine talking to each other counts as traffic, because to the kernel it is |
 
 ## Roadmap
 
-1. History on disk, so totals survive a restart and "what ran overnight" can be
-   asked the next morning.
-2. Alerts — a threshold per program, and a note when one crosses it.
-3. Hostnames, taken from the machine's own DNS activity rather than from reverse
+1. Alerts — a threshold per program, and a note when one crosses it.
+2. Hostnames, taken from the machine's own DNS activity rather than from reverse
    lookups, so a name shown is a name that was actually asked for.
-4. Per-program history, drawn.
+3. Per-program history over time, drawn.
+4. A report that compares today against the usual, so "unusual" needs no
+   threshold to be set by hand.
 
 ## License
 
