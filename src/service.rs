@@ -1,18 +1,20 @@
 //! Starting at boot.
 //!
 //! Recording only helps if it was running when the thing you want to know
-//! about happened, which means it has to start without being asked — before
-//! anyone logs in, and without a window.
+//! about happened, which means starting without being asked — before anyone
+//! logs in, and without a window.
 //!
 //! A scheduled task rather than a Run key: the Run key starts programs after
 //! login, unelevated, in the user's session. netwatch needs to be running
-//! before that and needs to be elevated, and a task set to run as SYSTEM at
-//! startup is exactly that — no window to hide, because session 0 has no
-//! desktop to put one on.
+//! before that and needs the rights. Session 0 has no desktop, so there is no
+//! window to hide.
 //!
-//! Nothing here installs anything on its own. Each of these is a deliberate
-//! command, because a program that quietly arranges to run forever on someone's
-//! machine is the behaviour of something else entirely.
+//! The task is registered from XML rather than from `schtasks` switches,
+//! because three of its defaults are wrong for something meant to run forever:
+//! a task is killed after 72 hours, will not start while the machine is on
+//! battery, and stops if it goes onto battery. On a laptop the first two mean
+//! the recorder is quietly not running for most of the time somebody wanted it
+//! recording, and nothing anywhere would say so.
 
 use std::process::Command;
 
@@ -27,6 +29,9 @@ pub enum Action {
         /// Delete day files older than this.
         #[arg(long, default_value_t = 30)]
         keep_days: u64,
+        /// Register the task but wait for the next boot to start recording.
+        #[arg(long)]
+        later: bool,
     },
     /// Stop recording at boot and remove the task.
     Uninstall,
@@ -36,7 +41,7 @@ pub enum Action {
 
 pub fn run(action: Action) -> Result<(), String> {
     match action {
-        Action::Install { keep_days } => install(keep_days),
+        Action::Install { keep_days, later } => install(keep_days, later),
         Action::Uninstall => uninstall(),
         Action::Status => status(),
     }
@@ -62,35 +67,127 @@ fn schtasks(args: &[&str]) -> Result<String, String> {
     }
 }
 
-fn install(keep_days: u64) -> Result<(), String> {
+/// The task definition, with every setting that matters stated rather than
+/// inherited.
+///
+/// `S-1-5-18` is SYSTEM by SID rather than by name, because the name is
+/// localised and this has to install on a Russian or a German Windows too.
+fn task_xml(exe: &str, keep_days: u64) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Records which program uses the network, so it can be asked about afterwards.</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <BootTrigger>
+      <Enabled>true</Enabled>
+    </BootTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-18</UserId>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{exe}</Command>
+      <Arguments>record --keep-days {keep_days}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#,
+        exe = escape(exe),
+    )
+}
+
+/// A path may contain `&`, and one unescaped character would make the whole
+/// definition unparseable — with an error about XML rather than about the path.
+fn escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn install(keep_days: u64, later: bool) -> Result<(), String> {
     let exe =
         std::env::current_exe().map_err(|e| format!("could not find this executable: {e}"))?;
+    let exe = exe.display().to_string();
 
-    // The task runs the binary where it stands. Moving or deleting it later
-    // breaks the task, so the path is printed rather than left implicit.
-    let command = format!("\"{}\" record --keep-days {keep_days}", exe.display());
+    let xml = task_xml(&exe, keep_days);
+    let path = std::env::temp_dir().join(format!("netwatch-task-{}.xml", std::process::id()));
 
-    schtasks(&[
-        "/create", "/tn", TASK, "/sc", "onstart", "/ru", "SYSTEM", "/rl", "HIGHEST", "/tr",
-        &command, "/f",
-    ])
-    .map_err(|e| {
+    // schtasks reads the definition as UTF-16; handed UTF-8 it fails with a
+    // parse error that says nothing about the encoding.
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in xml.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(&path, bytes)
+        .map_err(|e| format!("could not write the task definition: {e}"))?;
+
+    let result = schtasks(&[
+        "/create",
+        "/tn",
+        TASK,
+        "/xml",
+        &path.display().to_string(),
+        "/f",
+    ]);
+    let _ = std::fs::remove_file(&path);
+
+    result.map_err(|e| {
         format!(
             "{e}\n\nCreating a startup task needs an elevated terminal. \
              Run this from one opened as Administrator."
         )
     })?;
 
-    println!("Installed. netwatch will record from every boot.");
-    println!("  task:    {TASK}");
-    println!("  runs:    {command}");
-    println!("  as:      SYSTEM, at startup, with no window");
+    println!("Recording at every boot.");
+    println!("  task     {TASK}, as SYSTEM, with no window");
+    println!("  runs     {exe} record --keep-days {keep_days}");
+    println!("  log      one file a day, {keep_days} days kept");
     println!();
-    println!("It is not running yet — it starts at the next boot, or now with:");
-    println!("    schtasks /run /tn {TASK}");
+    println!("It keeps running on battery and has no time limit. Both defaults");
+    println!("would have stopped it on a laptop, without saying so.");
     println!();
-    println!("Then, any time after:  netwatch report --hours 12");
-    println!("To stop recording:     netwatch service uninstall");
+
+    if later {
+        println!("Not started yet; it begins at the next boot.");
+    } else {
+        match schtasks(&["/run", "/tn", TASK]) {
+            Ok(_) => println!("Started now, so there is no need to reboot first."),
+            Err(e) => println!("Registered, but could not start it now: {e}"),
+        }
+    }
+    println!();
+    println!("Any time after:     netwatch report --hours 12");
+    println!("To stop recording:  netwatch service uninstall");
     Ok(())
 }
 
@@ -109,7 +206,8 @@ fn uninstall() -> Result<(), String> {
 fn status() -> Result<(), String> {
     match schtasks(&["/query", "/tn", TASK, "/v", "/fo", "LIST"]) {
         Ok(text) => {
-            // The full listing is forty lines of which four matter.
+            // The full listing is forty lines of which five matter, and the
+            // labels are localised, so both spellings are looked for.
             let wanted = [
                 "Status",
                 "Last Run Time",
@@ -136,5 +234,59 @@ fn status() -> Result<(), String> {
             println!("    netwatch service install");
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three defaults that would quietly stop a recorder have to be
+    /// overridden. Each of them fails silently: nothing anywhere reports a
+    /// task that did not start because the machine was on battery.
+    #[test]
+    fn the_settings_that_would_stop_it_are_overridden() {
+        let xml = task_xml(r"C:\Program Files\netwatch\netwatch.exe", 30);
+
+        assert!(
+            xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"),
+            "without this the task is killed after 72 hours"
+        );
+        assert!(
+            xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"),
+            "the default refuses to start on battery"
+        );
+        assert!(
+            xml.contains("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"),
+            "the default stops when the machine goes onto battery"
+        );
+    }
+
+    /// SYSTEM by SID, because the account name is localised and a task
+    /// registered by name would fail to install on a non-English Windows.
+    #[test]
+    fn the_account_is_named_by_sid() {
+        let xml = task_xml("x.exe", 1);
+        assert!(xml.contains("<UserId>S-1-5-18</UserId>"));
+        assert!(!xml.contains("<UserId>SYSTEM</UserId>"));
+    }
+
+    /// Command and arguments as separate elements, which is the whole reason
+    /// for using XML: a path with spaces needs no quoting and cannot be
+    /// mis-split back into an argument.
+    #[test]
+    fn the_command_and_its_arguments_are_separate() {
+        let xml = task_xml(r"C:\Program Files\netwatch\netwatch.exe", 7);
+        assert!(xml.contains(r"<Command>C:\Program Files\netwatch\netwatch.exe</Command>"));
+        assert!(xml.contains("<Arguments>record --keep-days 7</Arguments>"));
+    }
+
+    /// One unescaped character in a path would break the whole definition,
+    /// with an error about XML rather than about the path.
+    #[test]
+    fn a_path_cannot_break_the_definition() {
+        let xml = task_xml(r"C:\Tools & Things\netwatch.exe", 30);
+        assert!(xml.contains("Tools &amp; Things"), "{xml}");
+        assert!(!xml.contains("Tools & Things"));
     }
 }
