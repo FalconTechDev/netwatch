@@ -28,6 +28,10 @@ pub struct Row {
     /// Where most of it went, as `addr:port=bytes`, biggest first. Capped, so
     /// one chatty program cannot make a line unbounded.
     pub peers: String,
+    /// The executable on disk. Worth a column of its own: a name tells you
+    /// nothing, and by the time anyone reads the log the process is long gone
+    /// and cannot be asked.
+    pub path: String,
 }
 
 impl Row {
@@ -36,7 +40,7 @@ impl Row {
     }
 }
 
-const HEADER: &str = "# minute\tpid\tname\tsent\treceived\tpeers";
+const HEADER: &str = "# minute\tpid\tname\tsent\treceived\tpeers\tpath";
 
 /// Where the record lives.
 ///
@@ -124,13 +128,14 @@ impl Writer {
         for r in rows {
             writeln!(
                 f,
-                "{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 r.minute,
                 r.pid,
                 sanitise(&r.name),
                 r.sent,
                 r.received,
-                sanitise(&r.peers)
+                sanitise(&r.peers),
+                sanitise(&r.path)
             )?;
         }
         f.flush()
@@ -197,6 +202,10 @@ fn parse(line: &str) -> Option<Row> {
         sent: f.next()?.parse().ok()?,
         received: f.next()?.parse().ok()?,
         peers: f.next().unwrap_or("").to_string(),
+        // Absent in files written before paths were recorded. Those rows are
+        // still perfectly good rows, so a missing column reads as empty rather
+        // than as a parse failure that would discard the whole day.
+        path: f.next().unwrap_or("").to_string(),
     };
     Some(row)
 }
@@ -268,6 +277,7 @@ mod tests {
             sent,
             received,
             peers: "1.2.3.4:443=100".into(),
+            path: "C:/app/thing.exe".into(),
         }
     }
 
@@ -337,6 +347,24 @@ mod tests {
         let back = read_range(&dir, 0, u64::MAX);
         assert_eq!(back.len(), 2, "the two intact rows survive");
         assert_eq!(back[1].name, "third.exe");
+    }
+
+    /// A log written before paths were recorded is still a log. Discarding
+    /// those days because a column is missing would throw away exactly the
+    /// history the tool exists to keep.
+    #[test]
+    fn rows_without_a_path_still_read() {
+        let dir = tmp("oldformat");
+        let header = "# minute\tpid\tname\tsent\treceived\tpeers\n";
+        let data = "28333333\t1\told.exe\t10\t20\t1.2.3.4:443=30\n";
+        let old = format!("{header}{data}");
+        fs::write(dir.join("netwatch-2023-11-14.tsv"), old).unwrap();
+
+        let back = read_range(&dir, 0, u64::MAX);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].name, "old.exe");
+        assert_eq!(back[0].received, 20, "the columns did not shift");
+        assert_eq!(back[0].path, "", "a missing path is empty, not a failure");
     }
 
     #[test]

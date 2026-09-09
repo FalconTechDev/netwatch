@@ -16,10 +16,21 @@ use ferrisetw::EventRecord;
 use ferrisetw::parser::Parser;
 use ferrisetw::provider::Provider;
 use ferrisetw::schema_locator::SchemaLocator;
-use ferrisetw::trace::UserTrace;
+use ferrisetw::trace::{UserTrace, stop_trace_by_name};
 
 /// {7DD42A49-5329-4832-8DFD-43D979153A88}
 const KERNEL_NETWORK: &str = "7dd42a49-5329-4832-8dfd-43d979153a88";
+
+/// The name our trace session runs under.
+///
+/// Fixed, not generated. An ETW session outlives the process that made it: if
+/// netwatch is killed — by a timeout, a crash, a reboot of the service — the
+/// session stays registered in the kernel. With a generated name every start
+/// leaks a new one, and Windows allows only about sixty-four in total, so a
+/// service that restarts often would eventually break tracing for everything
+/// on the machine. One fixed name means there is only ever one, and a
+/// leftover can be found and cleared.
+const SESSION: &str = "netwatch";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Proto {
@@ -101,6 +112,11 @@ fn decode(record: &EventRecord, locator: &SchemaLocator) -> Option<Event> {
 /// hands the event straight over, so a slow consumer costs dropped events in
 /// our channel rather than dropped events in the kernel's buffers.
 pub fn start(tx: Sender<Event>) -> Result<UserTrace, String> {
+    // Clear a session left behind by a previous run that did not exit
+    // cleanly. Failure here is the normal case — usually there is nothing to
+    // clear — so it is deliberately not an error.
+    let _ = stop_trace_by_name(SESSION);
+
     let provider = Provider::by_guid(KERNEL_NETWORK)
         .add_callback(move |record: &EventRecord, locator: &SchemaLocator| {
             if let Some(ev) = decode(record, locator) {
@@ -110,6 +126,7 @@ pub fn start(tx: Sender<Event>) -> Result<UserTrace, String> {
         .build();
 
     UserTrace::new()
+        .named(SESSION.to_string())
         .enable(provider)
         .start_and_process()
         .map_err(|e| {

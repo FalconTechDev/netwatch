@@ -10,7 +10,7 @@ use std::net::IpAddr;
 use std::time::Instant;
 
 use crate::etw::{Dir, Event, Proto};
-use crate::procs::Names;
+use crate::procs::{Info, Names};
 
 #[derive(Default, Clone)]
 pub struct Traffic {
@@ -37,6 +37,9 @@ pub struct Peer {
 pub struct Process {
     pub pid: u32,
     pub name: String,
+    /// Where it lives on disk, who it says wrote it. Resolved once, when the
+    /// process is first seen sending or receiving anything.
+    pub info: Info,
     pub traffic: Traffic,
     /// Bytes per second over the last tick, not since the start.
     pub sent_rate: f64,
@@ -62,6 +65,7 @@ impl Process {
 pub struct MinuteRow {
     pub pid: u32,
     pub name: String,
+    pub path: String,
     pub sent: u64,
     pub received: u64,
     pub peers: String,
@@ -100,10 +104,11 @@ impl State {
             Dir::Received => self.total.received += ev.bytes,
         }
 
-        let names = &mut self.names;
+        let info = self.names.get(ev.pid).clone();
         let proc = self.procs.entry(ev.pid).or_insert_with(|| Process {
             pid: ev.pid,
-            name: names.get(ev.pid).to_string(),
+            name: info.name.clone(),
+            info,
             traffic: Traffic::default(),
             sent_rate: 0.0,
             received_rate: 0.0,
@@ -181,6 +186,17 @@ impl State {
         self.procs.get(&pid)
     }
 
+    /// Replace what is known about a process. Only the tests use this: they
+    /// have to describe a program that is not running on the machine the test
+    /// happens to be executing on, or they would assert against whatever was.
+    #[cfg(test)]
+    pub fn set_info(&mut self, pid: u32, info: Info) {
+        if let Some(p) = self.procs.get_mut(&pid) {
+            p.name = info.name.clone();
+            p.info = info;
+        }
+    }
+
     /// What moved since this was last called, per process, resetting the
     /// baseline as it goes. This is what the log records: a minute's traffic
     /// rather than a running total, so a reader can add up any span they like.
@@ -214,6 +230,7 @@ impl State {
             out.push(MinuteRow {
                 pid: p.pid,
                 name: p.name.clone(),
+                path: p.info.path.clone(),
                 sent,
                 received,
                 peers: peers

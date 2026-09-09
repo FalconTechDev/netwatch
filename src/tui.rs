@@ -266,7 +266,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(" Enter", key),
-            Span::styled(" who it talks to   ", dim),
+            Span::styled(" what it is, where it talks   ", dim),
             Span::styled("t", key),
             Span::styled(" sort by rate/total   ", dim),
             Span::styled("j k", key),
@@ -278,19 +278,24 @@ fn draw(f: &mut Frame, app: &mut App) {
     );
 
     if let Some(pid) = app.expanded {
-        draw_peers(f, app, pid);
+        draw_detail(f, app, pid);
     }
 }
 
-/// Where one program has been talking. Addresses only — netwatch reads
-/// transfer events, which carry no hostname, and inventing one by reverse
+/// One program in full: what it says it is, where it lives, and where it has
+/// been talking.
+///
+/// The path is the point. `svchost.exe` from `System32` is the operating
+/// system; the same name from a temp directory, claiming nothing about itself,
+/// is the single most useful thing this screen can show. Peers are addresses
+/// only — the transfer events carry no hostname, and inventing one by reverse
 /// lookup would attach a name the traffic never mentioned.
-fn draw_peers(f: &mut Frame, app: &App, pid: u32) {
+fn draw_detail(f: &mut Frame, app: &App, pid: u32) {
     let Some(p) = app.state.get(pid) else { return };
 
     let area = f.area();
-    let w = area.width.saturating_sub(8).clamp(30, 84);
-    let h = area.height.saturating_sub(4).clamp(6, 24);
+    let w = area.width.saturating_sub(6).clamp(40, 100);
+    let h = area.height.saturating_sub(4).clamp(10, 26);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
@@ -300,6 +305,62 @@ fn draw_peers(f: &mut Frame, app: &App, pid: u32) {
 
     let mut peers: Vec<_> = p.peers.values().collect();
     peers.sort_by_key(|p| std::cmp::Reverse(p.traffic.total()));
+
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(Color::Cyan))
+            // The friendly name when the file carries one: "Mozilla Firefox"
+            // says more than "firefox.exe", and the file name is on the path
+            // line just below it either way.
+            .title(format!(" {} — Esc closes ", trunc(p.info.label(), 40))),
+        popup,
+    );
+
+    let inner = popup.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    let parts = Layout::vertical([Constraint::Length(5), Constraint::Min(1)]).split(inner);
+
+    let dim = Style::new().fg(Color::DarkGray);
+    let unknown = Style::new().fg(Color::Yellow);
+    let field = |label: &'static str, value: &str, empty: &'static str| {
+        let (text, style) = if value.is_empty() {
+            (empty.to_string(), unknown)
+        } else {
+            (value.to_string(), Style::new())
+        };
+        Line::from(vec![
+            Span::styled(format!("{label:<10}"), dim),
+            Span::styled(text, style),
+        ])
+    };
+
+    f.render_widget(
+        Paragraph::new(vec![
+            field(
+                "described",
+                &p.info.description,
+                "no description in the file",
+            ),
+            field(
+                "publisher",
+                &p.info.company,
+                "no publisher named in the file",
+            ),
+            field("path", &p.info.path, "could not be read"),
+            Line::from(vec![
+                Span::styled(format!("{:<10}", "traffic"), dim),
+                Span::styled(bytes(p.traffic.received), Style::new().fg(Color::Green)),
+                Span::styled(" down · ", dim),
+                Span::styled(bytes(p.traffic.sent), Style::new().fg(Color::Blue)),
+                Span::styled(format!(" up · pid {} · {} peers", p.pid, peers.len()), dim),
+            ]),
+        ]),
+        parts[0],
+    );
 
     let rows: Vec<Row> = peers
         .iter()
@@ -313,7 +374,6 @@ fn draw_peers(f: &mut Frame, app: &App, pid: u32) {
         })
         .collect();
 
-    f.render_widget(Clear, popup);
     f.render_widget(
         Table::new(
             rows,
@@ -333,18 +393,8 @@ fn draw_peers(f: &mut Frame, app: &App, pid: u32) {
             ])
             .style(Style::new().bold()),
         )
-        .column_spacing(1)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::new().fg(Color::Cyan))
-                .title(format!(
-                    " {} — {} peers, Esc closes ",
-                    trunc(&p.name, 28),
-                    peers.len()
-                )),
-        ),
-        popup,
+        .column_spacing(1),
+        parts[1],
     );
 }
 
@@ -374,6 +424,39 @@ mod tests {
             });
         }
         state.tick(1.0);
+
+        // Described here rather than read off the machine the test runs on:
+        // otherwise these assertions would be about whatever happened to hold
+        // pid 6124 today.
+        state.set_info(
+            6124,
+            crate::procs::Info {
+                name: "firefox.exe".into(),
+                path: "C:/Program Files/Mozilla Firefox/firefox.exe".into(),
+                description: "Mozilla Firefox".into(),
+                company: "Mozilla Corporation".into(),
+            },
+        );
+        state.set_info(
+            4852,
+            crate::procs::Info {
+                name: "backup-agent.exe".into(),
+                path: "C:/Program Files/Backup/backup-agent.exe".into(),
+                description: "Backup Agent".into(),
+                company: "Acme Ltd".into(),
+            },
+        );
+        // A file that claims nothing about itself: the interesting case.
+        state.set_info(
+            2628,
+            crate::procs::Info {
+                name: "mystery.exe".into(),
+                path: "C:/Users/x/AppData/Local/Temp/mystery.exe".into(),
+                description: String::new(),
+                company: String::new(),
+            },
+        );
+
         App {
             state,
             table: TableState::default().with_selected(0),
@@ -431,6 +514,47 @@ mod tests {
         assert!(
             !text.contains("84.17.53.155"),
             "peers leaked across processes:\n{text}"
+        );
+    }
+
+    /// The path is the point of the card: a name alone cannot tell System32
+    /// from a temp directory.
+    #[test]
+    fn the_card_shows_what_the_program_is_and_where_it_lives() {
+        let mut app = demo();
+        app.expanded = Some(6124);
+        let text = render(&mut app, 108, 18);
+        println!("\n{text}");
+        assert!(
+            text.contains("Mozilla Firefox"),
+            "description missing:\n{text}"
+        );
+        assert!(
+            text.contains("Mozilla Corporation"),
+            "publisher missing:\n{text}"
+        );
+        assert!(text.contains("firefox.exe"), "path missing:\n{text}");
+    }
+
+    /// A file that claims nothing about itself is the interesting case, and an
+    /// absence has to read as an absence rather than as a blank line.
+    #[test]
+    fn a_program_that_says_nothing_about_itself_says_so() {
+        let mut app = demo();
+        app.expanded = Some(2628);
+        let text = render(&mut app, 108, 18);
+        println!("\n{text}");
+        assert!(
+            text.contains("no description in the file"),
+            "an empty description must be stated:\n{text}"
+        );
+        assert!(
+            text.contains("no publisher named"),
+            "an empty publisher must be stated:\n{text}"
+        );
+        assert!(
+            text.contains("Temp"),
+            "the path is what makes this one worth looking at:\n{text}"
         );
     }
 

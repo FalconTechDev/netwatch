@@ -185,11 +185,21 @@ fn record(dir: std::path::PathBuf, keep_days: u64) -> Result<(), String> {
                     sent: r.sent,
                     received: r.received,
                     peers: r.peers,
+                    path: r.path,
                 })
                 .collect();
+            let moved: u64 = rows.iter().map(|r| r.sent + r.received).sum();
             if let Err(e) = writer.append(last_minute * 60, &rows) {
                 eprintln!("could not write the log: {e}");
             }
+            // A line a minute, so a service that is running but recording
+            // nothing looks different from one that is not running at all.
+            eprintln!(
+                "minute {last_minute}: {} programs, {} ({} events so far)",
+                rows.len(),
+                bytes(moved),
+                st.events
+            );
             last_minute = minute;
 
             let day = now / 86_400;

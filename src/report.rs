@@ -15,6 +15,10 @@ use crate::{bytes, trunc};
 /// A program's traffic over the period asked about.
 struct Total {
     name: String,
+    /// Where the executable lived, as last recorded. A name alone cannot tell
+    /// System32 from a temp directory, and by the time anyone reads a report
+    /// the process is long gone and cannot be asked.
+    path: String,
     sent: u64,
     received: u64,
     /// Minutes in which it moved anything — how much of the period it was busy
@@ -65,6 +69,7 @@ fn summarise(rows: &[Row]) -> HashMap<String, Total> {
     for r in rows {
         let e = by_name.entry(r.name.clone()).or_insert_with(|| Total {
             name: r.name.clone(),
+            path: String::new(),
             sent: 0,
             received: 0,
             active_minutes: 0,
@@ -73,6 +78,11 @@ fn summarise(rows: &[Row]) -> HashMap<String, Total> {
         });
         e.sent += r.sent;
         e.received += r.received;
+        // Whichever row carried a path wins; rows written before paths were
+        // recorded have none.
+        if e.path.is_empty() && !r.path.is_empty() {
+            e.path = r.path.clone();
+        }
         *per_minute.entry((r.name.clone(), r.minute)).or_insert(0) += r.total();
     }
 
@@ -135,6 +145,12 @@ fn everything(rows: &[Row], hours: u64, top: usize) {
             clock(t.peak_minute),
             bytes(t.peak_bytes)
         );
+        // Only when it is not the ordinary place for it: a line per program
+        // doubles the table, and `C:\Windows\System32` under every Windows
+        // component is noise rather than information.
+        if !t.path.is_empty() && !is_system_path(&t.path) {
+            println!("{:<26} {}", "", t.path);
+        }
     }
 
     if totals.len() > top {
@@ -144,6 +160,17 @@ fn everything(rows: &[Row], hours: u64, top: usize) {
         );
     }
     println!("\nOne program in detail:  netwatch report --program <name>");
+}
+
+/// Whether an executable lives where Windows keeps its own.
+///
+/// Used only to decide whether the path is worth a line of its own in the
+/// summary — never to decide whether something is trustworthy. A path proves
+/// nothing on its own, and treating one as a clean bill of health is exactly
+/// the mistake that would make a tool like this misleading.
+fn is_system_path(path: &str) -> bool {
+    let p = path.to_lowercase().replace('/', "\\");
+    p.starts_with("c:\\windows\\") || p.starts_with("c:\\program files")
 }
 
 fn one_program(rows: &[Row], name: &str, hours: u64) {
@@ -161,11 +188,26 @@ fn one_program(rows: &[Row], name: &str, hours: u64) {
     let sent: u64 = mine.iter().map(|r| r.sent).sum();
     let received: u64 = mine.iter().map(|r| r.received).sum();
     println!(
-        "{name} — last {hours} h: {} down, {} up, over {} minutes\n",
+        "{name} — last {hours} h: {} down, {} up, over {} minutes",
         bytes(received),
         bytes(sent),
         mine.len()
     );
+
+    // Where it ran from. The process is long gone by report time, so the log
+    // is the only place this answer still exists.
+    let paths: std::collections::BTreeSet<&str> = mine
+        .iter()
+        .map(|r| r.path.as_str())
+        .filter(|p| !p.is_empty())
+        .collect();
+    for p in &paths {
+        println!("  ran from {p}");
+    }
+    if paths.len() > 1 {
+        println!("  (more than one executable answered to this name)");
+    }
+    println!();
 
     // Where it went. The log keeps only the busiest few peers per minute, so
     // this is where the bulk went rather than an exhaustive list — said here
@@ -211,6 +253,7 @@ mod tests {
             sent,
             received,
             peers: peers.into(),
+            path: String::new(),
         }
     }
 
@@ -252,6 +295,22 @@ mod tests {
         let s = summarise(&rows);
         assert_eq!(s["a.exe"].peak_minute, 200);
         assert_eq!(s["a.exe"].peak_bytes, 10_000);
+    }
+
+    /// The path decides whether a line is worth printing, and nothing more.
+    /// A program living in System32 is where Windows keeps its own; that is a
+    /// statement about tidiness, never about trust.
+    #[test]
+    fn ordinary_locations_are_recognised_as_ordinary() {
+        assert!(is_system_path("C:\\Windows\\System32\\svchost.exe"));
+        assert!(is_system_path("c:/windows/system32/svchost.exe"));
+        assert!(is_system_path("C:\\Program Files\\Mullvad VPN\\daemon.exe"));
+        assert!(is_system_path("C:\\Program Files (x86)\\thing.exe"));
+
+        // The cases worth a line of their own.
+        assert!(!is_system_path("C:\\Users\\x\\AppData\\Local\\Temp\\x.exe"));
+        assert!(!is_system_path("D:\\games\\thing.exe"));
+        assert!(!is_system_path(""));
     }
 
     #[test]
