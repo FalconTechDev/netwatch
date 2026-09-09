@@ -145,9 +145,18 @@ and cannot be asked:
 
 ```
 $ netwatch report --program backup-agent --hours 12
-backup-agent.exe — last 12 h: 38.2 GB down, 412.0 MB up, over 184 minutes
+backup-agent.exe — last 12 h: 38.2 GB down, 412.0 MB up
+  active   184 minutes, 09-09 03:12 → 09-09 06:16 UTC
+  peak     2.1 GB in one minute  (35.8 MB/s)
+  pid      4852, 7714 — it restarted
   ran from C:\Users\you\AppData\Roaming\backup\backup-agent.exe
 ```
+
+Every line there answers a different question. **When** narrows an overnight
+total to a window. **Peak** says whether it saturated the link or trickled.
+**Pid**, when there is more than one, explains a total no single run could
+account for — it restarted. And **where it ran from** is the only place that
+answer still exists, since the process is long gone by the time anyone reads it.
 
 In the summary a path is printed only when it is somewhere other than the
 ordinary places — a line under every Windows component saying `System32` is
