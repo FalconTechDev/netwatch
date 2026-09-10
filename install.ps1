@@ -148,6 +148,7 @@ else {
     }
     Write-Host ""
     Write-Host "Log at $env:ProgramData\netwatch" -ForegroundColor Green
+    Write-Host "An icon is now by the clock, and returns at every logon." -ForegroundColor Green
 }
 
 Write-Host ''

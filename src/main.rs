@@ -13,6 +13,7 @@ mod procs;
 mod report;
 mod service;
 mod state;
+mod tray;
 mod tui;
 
 use std::sync::mpsc;
@@ -60,6 +61,8 @@ enum Cmd {
         #[arg(long)]
         dir: Option<std::path::PathBuf>,
     },
+    /// Sit by the clock, showing what is being recorded.
+    Tray,
     /// Programs kept out of the live view — still recorded, still in reports.
     Hidden {
         /// Show every program again.
@@ -93,6 +96,7 @@ fn main() -> Result<(), String> {
             top,
             dir,
         } => report::run(&dir.unwrap_or_else(log::default_dir), hours, program, top),
+        Cmd::Tray => tray::run(),
         Cmd::Hidden { clear } => hidden_list(clear),
         Cmd::Service { action } => service::run(action),
     }

@@ -112,6 +112,23 @@ merely running netwatch; this is a separate, deliberate command, because a
 program that quietly arranges to run forever on someone's machine is the
 behaviour of something else entirely. `netwatch service uninstall` removes it.
 
+The same command also puts an icon by the clock. The recorder is SYSTEM in
+session 0, which has no desktop and so can show nothing; the icon is a second,
+unelevated program (`netwatch tray`) registered to start at your logon, in your
+own session, reading the same log the recorder writes. It shows the totals since
+boot in its tooltip and offers the live view, a 12-hour report, and the log
+folder from its menu. Quitting it leaves recording untouched.
+
+## Everything since the machine came up
+
+Type `netwatch` with no arguments and the live view opens already holding the
+whole history since boot — not a blank screen that starts counting from the
+moment you looked. It seeds itself from the recorder's log, folds those totals
+into what each program has moved, and then keeps counting live on top of them.
+The header says **since boot** when it is showing seeded history, and turns red
+with `NOT RECORDING — run: netwatch service install` when there is no log to
+seed from, so an empty screen can never be mistaken for a quiet network.
+
 From then on:
 
 ```

@@ -49,6 +49,11 @@ struct App {
     confirm: Option<Confirm>,
     /// The last thing that happened, said once in the header.
     status: String,
+    /// Seconds of recorded history loaded at startup, and whether there was a
+    /// record to load at all. The totals mean nothing without knowing which
+    /// span they cover.
+    history_secs: u64,
+    recording: bool,
     /// What to match against, and whether the box has focus.
     search: String,
     searching: bool,
@@ -122,8 +127,23 @@ pub fn run() -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
     let trace = etw::start(tx)?;
 
+    // Everything the recorder saw since this machine started. Without it the
+    // screen answers "since you pressed enter", which is almost never the
+    // question: the machine has been up for hours and something was watching.
+    let mut state = State::new();
+    let dir = crate::log::default_dir();
+    let boot = crate::log::boot_secs();
+    let rows = crate::log::read_range(&dir, boot / 60, u64::MAX);
+    let recording = !rows.is_empty();
+    state.seed(&rows);
+    let history_secs = if recording {
+        crate::log::now_secs().saturating_sub(boot)
+    } else {
+        0
+    };
+
     let mut app = App {
-        state: State::new(),
+        state,
         table: TableState::default().with_selected(0),
         by_rate: true,
         expanded: None,
@@ -135,6 +155,8 @@ pub fn run() -> Result<(), String> {
         searching: false,
         only_active: false,
         frozen: None,
+        history_secs,
+        recording,
         started: Instant::now(),
     };
 
@@ -410,15 +432,35 @@ fn draw(f: &mut Frame, app: &mut App) {
             ),
             Span::styled(
                 format!(
-                    "{} program{} · {} in {}m{:02}s · by {}",
+                    "{} program{} · {} in {} · by {}",
                     shown,
                     if shown == 1 { "" } else { "s" },
                     bytes(app.state.total.total()),
-                    elapsed / 60,
-                    elapsed % 60,
+                    // The span the totals actually cover: since the machine
+                    // started when there is a record to read, otherwise only
+                    // since this window opened.
+                    if app.recording {
+                        format!(
+                            "{} since boot",
+                            ago(Duration::from_secs(app.history_secs + elapsed))
+                        )
+                    } else {
+                        format!("{} this run", ago(Duration::from_secs(elapsed)))
+                    },
                     if app.by_rate { "rate" } else { "total" }
                 ),
                 Style::new().fg(Color::DarkGray),
+            ),
+            // The failure that is otherwise invisible: nothing is recording,
+            // so nothing will be there to ask about later. Said on the screen
+            // rather than left to be discovered the morning after.
+            Span::styled(
+                if app.recording {
+                    String::new()
+                } else {
+                    "  ·  NOT RECORDING — run:  netwatch service install".to_string()
+                },
+                Style::new().fg(Color::Red).bold(),
             ),
             // Never filter silently: a list that is quietly incomplete is
             // worse than one that is long.
@@ -948,6 +990,8 @@ mod tests {
             searching: false,
             only_active: false,
             frozen: None,
+            history_secs: 0,
+            recording: true,
             started: Instant::now(),
         }
     }

@@ -53,6 +53,24 @@ pub fn default_dir() -> PathBuf {
     Path::new(&base).join("netwatch")
 }
 
+/// When this machine last started, as a unix timestamp.
+///
+/// Taken from how long it has been up rather than from any recorded event,
+/// because that is the one number that is true regardless of what was running
+/// at the time — including netwatch itself.
+#[cfg(windows)]
+pub fn boot_secs() -> u64 {
+    // SAFETY: GetTickCount64 takes nothing and returns milliseconds since
+    // boot; there is no failure mode and nothing to free.
+    let uptime_ms = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
+    now_secs().saturating_sub(uptime_ms / 1_000)
+}
+
+#[cfg(not(windows))]
+pub fn boot_secs() -> u64 {
+    now_secs()
+}
+
 pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -236,6 +236,86 @@ impl State {
         v
     }
 
+    /// Fold recorded history into the totals, so the live view opens knowing
+    /// what happened before it was started.
+    ///
+    /// Without this the screen answers "since you pressed enter", which is
+    /// almost never the question — the machine has been up for hours and the
+    /// recorder was watching all of it. Rates are deliberately left alone:
+    /// they describe now, and a minute from three hours ago is not now.
+    pub fn seed(&mut self, rows: &[crate::log::Row]) -> usize {
+        let now = Instant::now();
+        for r in rows {
+            self.total.sent += r.sent;
+            self.total.received += r.received;
+
+            let proc = self.procs.entry(r.pid).or_insert_with(|| Process {
+                pid: r.pid,
+                name: r.name.clone(),
+                info: Info {
+                    name: r.name.clone(),
+                    path: r.path.clone(),
+                    ..Info::default()
+                },
+                traffic: Traffic::default(),
+                sent_rate: 0.0,
+                received_rate: 0.0,
+                peers: HashMap::new(),
+                first_seen: now,
+                last_seen: now,
+                history: VecDeque::with_capacity(HISTORY),
+                previous: Traffic::default(),
+                minute_base: Traffic::default(),
+            });
+            proc.traffic.sent += r.sent;
+            proc.traffic.received += r.received;
+
+            // The baselines move with the totals, or the first tick after
+            // loading would report three hours of traffic as one second of it.
+            proc.previous = proc.traffic.clone();
+            proc.minute_base = proc.traffic.clone();
+
+            for part in r.peers.split(';').filter(|s| !s.is_empty()) {
+                let Some((who, moved)) = part.rsplit_once('=') else {
+                    continue;
+                };
+                let Ok(moved) = moved.parse::<u64>() else {
+                    continue;
+                };
+                // `name@addr:port` when the machine looked it up, plain
+                // `addr:port` when it did not.
+                let (host, endpoint) = match who.split_once('@') {
+                    Some((h, e)) => (Some(h.to_string()), e),
+                    None => (None, who),
+                };
+                let Some((addr, port)) = endpoint.rsplit_once(':') else {
+                    continue;
+                };
+                let (Ok(addr), Ok(port)) = (addr.parse::<IpAddr>(), port.parse::<u16>()) else {
+                    continue;
+                };
+                let peer = proc.peers.entry(addr).or_insert_with(|| Peer {
+                    addr,
+                    port,
+                    proto: Proto::Tcp,
+                    traffic: Traffic::default(),
+                    last_seen: now,
+                    host: host.clone(),
+                    minute_base: Traffic::default(),
+                });
+                // The log keeps one figure per peer per minute rather than a
+                // direction, so it lands where it cannot be mistaken for a
+                // measured split: received, and said so in the README.
+                peer.traffic.received += moved;
+                peer.minute_base = peer.traffic.clone();
+                if peer.host.is_none() {
+                    peer.host = host;
+                }
+            }
+        }
+        rows.len()
+    }
+
     pub fn get(&self, pid: u32) -> Option<&Process> {
         self.procs.get(&pid)
     }
