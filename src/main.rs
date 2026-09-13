@@ -10,8 +10,10 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 
+#[cfg(windows)]
+use netwatch::service;
 use netwatch::state::State;
-use netwatch::{bytes, etw, hidden, log, report, service, trunc, tui};
+use netwatch::{bytes, hidden, log, report, source, trunc, tui};
 
 #[derive(Parser)]
 #[command(
@@ -57,7 +59,9 @@ enum Cmd {
         #[arg(long)]
         clear: bool,
     },
-    /// Start recording at boot, or stop doing so.
+    /// Start recording at boot, or stop doing so. Windows only for now:
+    /// Linux would want a systemd unit, which is not written yet.
+    #[cfg(windows)]
     Service {
         #[command(subcommand)]
         action: service::Action,
@@ -85,6 +89,7 @@ fn main() -> Result<(), String> {
             dir,
         } => report::run(&dir.unwrap_or_else(log::default_dir), hours, program, top),
         Cmd::Hidden { clear } => hidden_list(clear),
+        #[cfg(windows)]
         Cmd::Service { action } => service::run(action),
     }
 }
@@ -94,7 +99,7 @@ fn main() -> Result<(), String> {
 /// a script, or piped into a file.
 fn top(seconds: u64, by_total: bool) -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
-    let trace = etw::start(tx)?;
+    let trace = source::start(tx)?;
 
     println!("Watching for {seconds} s…\n");
     let started = Instant::now();
@@ -185,7 +190,7 @@ fn hidden_list(clear: bool) -> Result<(), String> {
 /// only mode that can, because it is the only one running at the time.
 fn record(dir: std::path::PathBuf, keep_days: u64) -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
-    let _trace = etw::start(tx)?;
+    let _trace = source::start(tx)?;
 
     let mut st = State::new();
     let mut writer = log::Writer::new(dir.clone());

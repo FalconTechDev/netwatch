@@ -56,8 +56,8 @@ pub fn run(dir: &Path, hours: u64, program: Option<String>, top: usize) -> Resul
         );
         println!();
         println!("If netwatch was not running then, it could not have seen it.");
-        println!("To record from now on, from an elevated terminal:");
-        println!("    netwatch service install");
+        println!("To record from now on, from a terminal with the rights to:");
+        println!("    {}", crate::HOW_TO_RECORD);
         return Ok(());
     }
 

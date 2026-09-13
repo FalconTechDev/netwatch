@@ -48,9 +48,20 @@ const HEADER: &str = "# minute\tpid\tname\tsent\treceived\tpeers\tpath";
 /// machine-wide service: it starts before anyone logs in and records traffic
 /// for every account. Users can read it; only an administrator can write it,
 /// which is the right way round for a log that is evidence.
+#[cfg(windows)]
 pub fn default_dir() -> PathBuf {
     let base = std::env::var("ProgramData").unwrap_or_else(|_| ".".into());
     Path::new(&base).join("netwatch")
+}
+
+/// The same intent as on Windows, spelled the way this system spells it:
+/// somewhere machine-wide that survives logging out, that anyone may read and
+/// only root may write. Falling back to the working directory, as the Windows
+/// side does when its variable is missing, would scatter a machine-wide log
+/// through whatever directories it happened to be started from.
+#[cfg(not(windows))]
+pub fn default_dir() -> PathBuf {
+    PathBuf::from("/var/log/netwatch")
 }
 
 /// When this machine last started, as a unix timestamp.
@@ -66,7 +77,23 @@ pub fn boot_secs() -> u64 {
     now_secs().saturating_sub(uptime_ms / 1_000)
 }
 
-#[cfg(not(windows))]
+/// The first field of `/proc/uptime` is seconds since boot, as a float.
+#[cfg(target_os = "linux")]
+pub fn boot_secs() -> u64 {
+    let uptime = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| {
+            s.split_whitespace()
+                .next()
+                .and_then(|first| first.parse::<f64>().ok())
+        })
+        .unwrap_or(0.0);
+    now_secs().saturating_sub(uptime as u64)
+}
+
+/// Without a way to ask, the safest answer is "now": it reads as an empty
+/// history rather than inventing one.
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn boot_secs() -> u64 {
     now_secs()
 }

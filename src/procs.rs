@@ -113,10 +113,59 @@ impl Names {
         }
     }
 
-    #[cfg(not(windows))]
+    /// Sweep `/proc` for what is running now.
+    ///
+    /// The name is taken from the executable's path where that can be read,
+    /// rather than from `comm`: the kernel truncates `comm` to fifteen
+    /// characters, so a longer name would be quietly cut short and two
+    /// different programs could end up looking like the same one. `comm` is
+    /// the fallback for processes whose `exe` link cannot be followed, which
+    /// includes every kernel thread.
+    #[cfg(target_os = "linux")]
     fn refresh(&mut self) {
-        // netwatch reads a Windows kernel provider; there is nothing to sweep
-        // anywhere else, and pretending otherwise would hide that.
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return;
+        };
+        for entry in entries.flatten() {
+            // Only the numeric entries are processes; the rest of /proc is
+            // the kernel's own files.
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+
+            let path = image_path(pid);
+            let name = if path.is_empty() {
+                std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                    .map(|s| s.trim().to_owned())
+                    .unwrap_or_default()
+            } else {
+                std::path::Path::new(&path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            };
+
+            if name.is_empty() {
+                continue;
+            }
+            self.cache.insert(
+                pid,
+                Info {
+                    name,
+                    path,
+                    ..Info::default()
+                },
+            );
+        }
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    fn refresh(&mut self) {
+        // No source of process names is written for this system yet.
     }
 }
 
@@ -150,7 +199,20 @@ fn image_path(pid: u32) -> String {
     }
 }
 
-#[cfg(not(windows))]
+/// Where the process was run from, by following `/proc/<pid>/exe`.
+///
+/// The link is only readable for processes this one owns, or for everything
+/// when running as root — which netwatch does on Linux anyway, because loading
+/// its eBPF program needs the privilege. A process that has exited leaves
+/// nothing to follow, and an empty path says so.
+#[cfg(target_os = "linux")]
+fn image_path(pid: u32) -> String {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn image_path(_pid: u32) -> String {
     String::new()
 }
@@ -225,11 +287,6 @@ fn version_info(path: &str) -> (String, String) {
 
         (read("FileDescription"), read("CompanyName"))
     }
-}
-
-#[cfg(not(windows))]
-fn version_info(_path: &str) -> (String, String) {
-    (String::new(), String::new())
 }
 
 /// Ask a process to stop.
@@ -360,6 +417,9 @@ mod tests {
 
     /// Version information is optional in a PE file and absent from plenty of
     /// real ones, so its absence must be ordinary rather than an error.
+    ///
+    /// A PE resource is a Windows idea, and so is the function that reads one.
+    #[cfg(windows)]
     #[test]
     fn a_file_without_version_information_is_not_a_failure() {
         assert_eq!(version_info(""), (String::new(), String::new()));

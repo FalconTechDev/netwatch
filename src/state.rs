@@ -9,7 +9,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::time::Instant;
 
-use crate::etw::{Dir, Event, Proto, Transfer};
+use crate::event::{Dir, Event, Proto, Transfer};
 use crate::procs::{Info, Names};
 
 #[derive(Default, Clone)]

@@ -7,6 +7,16 @@
 //! flag and an entry point.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+/// The tray is a Windows notification icon. Linux has its own answer to the
+/// same idea (a StatusNotifierItem), which is not written yet; until it is,
+/// this binary exists there only so the crate builds, and says so.
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("netwatch-tray is a Windows program; there is no tray icon on this system yet.");
+    std::process::exit(1);
+}
+
+#[cfg(windows)]
 fn main() {
     if let Err(e) = netwatch::tray::run() {
         // There is no console to print to, by design. A failure here is rare

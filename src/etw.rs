@@ -12,6 +12,8 @@
 use std::net::IpAddr;
 use std::sync::mpsc::Sender;
 
+use crate::event::{Dir, Event, Proto, Transfer};
+
 use ferrisetw::EventRecord;
 use ferrisetw::parser::Parser;
 use ferrisetw::provider::Provider;
@@ -31,50 +33,6 @@ const KERNEL_NETWORK: &str = "7dd42a49-5329-4832-8dfd-43d979153a88";
 /// on the machine. One fixed name means there is only ever one, and a
 /// leftover can be found and cleared.
 const SESSION: &str = "netwatch";
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Proto {
-    Tcp,
-    Udp,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Dir {
-    /// Out of this machine.
-    Sent,
-    /// Into it.
-    Received,
-}
-
-/// Anything the kernel told us, in the order it said it.
-///
-/// Names and transfers share one channel deliberately: a DNS answer arrives
-/// before the traffic that follows it, and one ordered stream keeps it that
-/// way. Two channels would race, and a peer would be named a moment after it
-/// first appeared on screen.
-#[derive(Clone, Debug)]
-pub enum Event {
-    Transfer(Transfer),
-    /// An address the machine looked up, and the name it asked for.
-    Named {
-        addr: IpAddr,
-        host: String,
-    },
-}
-
-/// One send or receive, as the kernel reported it.
-#[derive(Clone, Copy, Debug)]
-pub struct Transfer {
-    pub pid: u32,
-    pub proto: Proto,
-    pub dir: Dir,
-    pub bytes: u64,
-    /// The other end. For a send this is where it went; for a receive, where
-    /// it came from — the provider names both fields from the packet's point
-    /// of view, so they are normalised here to mean "the peer".
-    pub peer: IpAddr,
-    pub peer_port: u16,
-}
 
 /// Opcodes from the provider's manifest. They come in send/receive pairs, one
 /// pair per protocol and address family, and nothing else in the provider is

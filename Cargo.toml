@@ -6,13 +6,22 @@ edition = "2024"
 description = "See which program is using your connection, live"
 license = "MIT"
 
+# The eBPF program is a workspace member so it shares the lockfile, but it is
+# kept out of `default-members`: it only builds for the `bpfel-unknown-none`
+# target with a pinned nightly, and `cargo build` here must stay the ordinary
+# thing it was. The build script compiles it separately, on Linux only.
+[workspace]
+resolver = "3"
+members = ["netwatch-common", "netwatch-ebpf"]
+default-members = ["."]
+
 [dependencies]
-ferrisetw = "1.2.0"
 ratatui = "0.29"
 clap = { version = "4", features = ["derive"] }
-tray-icon = "0.24.2"
 
 [target.'cfg(windows)'.dependencies]
+ferrisetw = "1.2.0"
+tray-icon = "0.24.2"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_ToolHelp",
@@ -22,6 +31,25 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { version = "0.14", default-features = false }
+libc = "0.2"
+netwatch-common = { path = "netwatch-common" }
+
+# Matched against the host, not the target: these are only needed on the
+# machine actually compiling the eBPF program.
+[target.'cfg(target_os = "linux")'.build-dependencies]
+anyhow = "1"
+aya-build = { version = "0.2", default-features = false }
+cargo_metadata = { version = "0.23", default-features = false }
+
 [profile.release]
 lto = true
 codegen-units = 1
+
+# The eBPF object must keep its debug info: that is where its BTF lives, and
+# the kernel's verifier reads it. Stripping it makes the program unloadable.
+[profile.release.package.netwatch-ebpf]
+debug = 2
+codegen-units = 1
+strip = false

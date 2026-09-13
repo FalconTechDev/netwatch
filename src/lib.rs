@@ -9,15 +9,48 @@
 //! everything it needs lives here where both can reach it.
 
 pub mod dns;
-pub mod etw;
+pub mod event;
 pub mod hidden;
 pub mod log;
 pub mod procs;
 pub mod report;
-pub mod service;
 pub mod state;
-pub mod tray;
 pub mod tui;
+
+// The data source, and only the data source, is what differs between systems.
+// Each of these produces the same `event::Event` stream; everything above them
+// is the same code on both.
+#[cfg(target_os = "linux")]
+pub mod ebpf;
+#[cfg(windows)]
+pub mod etw;
+
+// The source for this platform, under one name, so callers need no `cfg` of
+// their own.
+#[cfg(target_os = "linux")]
+pub use ebpf as source;
+#[cfg(windows)]
+pub use etw as source;
+
+/// How to start recording on this system, wherever that is suggested.
+///
+/// Windows registers a scheduled task that runs from every boot. Linux has no
+/// equivalent here yet, and naming one would send someone to a subcommand that
+/// does not exist on their machine — so what is offered there is the thing
+/// that does work today. A wrong instruction is worse than a modest one: it
+/// costs the reader the time to find out it was wrong.
+#[cfg(windows)]
+pub const HOW_TO_RECORD: &str = "netwatch service install";
+#[cfg(not(windows))]
+pub const HOW_TO_RECORD: &str = "netwatch record";
+
+// Starting at boot and sitting in the tray are both done the way Windows does
+// them — a scheduled task and a notification icon. Linux has its own answers
+// (a systemd unit, a StatusNotifierItem), which are not written yet.
+#[cfg(windows)]
+pub mod service;
+#[cfg(windows)]
+pub mod tray;
 
 /// Byte counts are compared, not read digit by digit.
 pub fn bytes(v: u64) -> String {

@@ -6,20 +6,27 @@
 
 [![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange?logo=rust&logoColor=white)](https://rust-lang.org)
 [![Windows](https://img.shields.io/badge/Windows-10%2B-0078D6?logo=windows&logoColor=white)](#)
+[![Linux](https://img.shields.io/badge/Linux-eBPF-FCC624?logo=linux&logoColor=black)](#)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
 </div>
 
 ---
 
-Windows will not tell you this. Task Manager gives one number for the whole
+Your system will not tell you this. Task Manager gives one number for the whole
 machine. Resource Monitor shows a live list and forgets it the moment you close
 the window — no totals, no history, no answer to "what was downloading while I
 was asleep". The tools that do it properly cost money.
 
-The information exists. The Windows kernel reports **every** send and receive
-with the process that caused it and the byte count already attached. netwatch
-reads that, and nothing else.
+The information exists. The kernel already knows which process caused every
+send and receive, and how many bytes it was. netwatch asks it, and does nothing
+else.
+
+It runs on **Windows and Linux**, and asks each one in its own language: ETW on
+Windows, **eBPF** on Linux. That is the only part that differs. Both produce the
+same stream of events, and everything above it — the aggregation, the log, the
+reports, the live view — is one body of code that does not know which kernel is
+underneath it.
 
 ```
 netwatch                    # live, full screen
@@ -134,8 +141,11 @@ whole history since boot — not a blank screen that starts counting from the
 moment you looked. It seeds itself from the recorder's log, folds those totals
 into what each program has moved, and then keeps counting live on top of them.
 The header says **since boot** when it is showing seeded history, and turns red
-with `NOT RECORDING — run: netwatch service install` when there is no log to
-seed from, so an empty screen can never be mistaken for a quiet network.
+with `NOT RECORDING` when there is no log to seed from, so an empty screen can
+never be mistaken for a quiet network. The warning names the command that
+starts recording *on the system you are on* — they differ — and it sits at the
+front of the line, because the end of a line is what a narrow terminal cuts off
+and a warning only visible on wide screens is not a warning.
 
 From then on:
 
@@ -286,6 +296,8 @@ an elevated session. Without it the session refuses to start and says so.
 
 ## Install
 
+### Windows
+
 From an **elevated** PowerShell:
 
 ```powershell
@@ -319,6 +331,57 @@ cargo build --release
 One binary. No driver and no runtime; the only thing it adds to the machine is
 the startup task.
 
+### Linux
+
+```sh
+curl -fsSL https://github.com/FalconTechDev/netwatch/releases/latest/download/install.sh | sh
+```
+
+That installs the binary and grants it `CAP_BPF` and `CAP_PERFMON`, so
+**netwatch runs without sudo afterwards**. Reading which process sent a packet
+means loading a program into the kernel, which is privileged; these are the two
+narrow rights that replaced blanket `CAP_SYS_ADMIN` in kernel 5.8, and asking
+for them rather than for root is asking for the least that works. If the
+filesystem cannot carry capabilities the installer says so and tells you to use
+`sudo`, rather than leaving you to discover it as a permission error.
+
+Recording at boot is a scheduled task on Windows; the systemd unit that would
+be its counterpart is not written yet, so on Linux `netwatch record` is run by
+hand for now — and the program says that, instead of naming a subcommand it
+does not have.
+
+Needs a kernel with BTF (`CONFIG_DEBUG_INFO_BTF`), which every current
+distribution ships. The installer checks and warns before it installs anything.
+
+## How Linux is asked
+
+ETW has no equivalent here, so the question is put to the kernel directly, with
+a small program loaded into it:
+
+* **`tcp_sendmsg`** is called once per send, with the byte count as an
+  argument.
+* **`tcp_cleanup_rbuf`** is the receive side — not `tcp_recvmsg`, which is
+  entered *before* it knows how much it will return. The count only exists on
+  the way out.
+
+Both are entry probes in the kernel's hot path, so the work done there is a few
+loads and a write into a ring buffer; anything slower would be felt by every
+connection on the machine. The ring buffer is shared across CPUs, so events
+keep their order — which is what lets a name be recorded before the traffic it
+belongs to. When it fills, the kernel drops the event rather than waiting:
+losing a sample is better than stalling a send.
+
+Process ids are reported **in the namespace you are in**. The kernel counts
+processes in the namespace it booted in, so inside a container — and WSL is one
+— its numbers name nothing that `/proc` or `ps` can find. They look perfectly
+reasonable and refer to other processes entirely, which is worse than no answer
+at all, so the program asks for ids in the caller's namespace and falls back to
+the kernel's own only when a process is not in it.
+
+Names come from `/proc/<pid>/exe` rather than from `comm`: the kernel truncates
+`comm` to fifteen characters, and two different programs would quietly become
+the same one.
+
 ## Correctness
 
 The failure mode that matters here is not a crash — it is a number that is
@@ -348,8 +411,10 @@ cargo test
 
 | Limit | Consequence |
 |---|---|
-| Windows only | The provider this reads is a Windows kernel provider; there is no equivalent to fall back to |
-| Needs Administrator | A real-time ETW session cannot be opened without it |
+| Needs privilege | An ETW session needs Administrator; loading an eBPF program needs `CAP_BPF` and `CAP_PERFMON`. Neither question can be asked without them |
+| Linux shows no peer addresses yet | Byte counts and processes are right; reading the socket's far end needs field offsets for the running kernel, which is the next piece of work |
+| Linux counts TCP only | UDP has its own pair of kernel functions and is not hooked yet |
+| Linux has no boot-time recorder | Windows registers a scheduled task; the systemd unit for Linux is not written, so `netwatch record` is started by hand there |
 | Only looked-up names are shown | A peer is named when this machine resolved it. Hard-coded addresses, and answers cached before netwatch started, stay addresses |
 | The record starts when you install it | netwatch cannot report on traffic from before it was recording — there is nothing kept anywhere else to read |
 | Times are UTC | The log and the reports use one clock, so a time printed matches a time in the file, wherever the file is read |
@@ -357,10 +422,14 @@ cargo test
 
 ## Roadmap
 
-1. Alerts — a threshold per program, and a note when one crosses it.
-2. A report that compares today against the usual, so "unusual" needs no
+1. Peer addresses on Linux — reading the socket's far end in the kernel, so a
+   Linux row says where it went, as the Windows one already does.
+2. UDP on Linux, which is the other half of the traffic.
+3. A systemd unit, so Linux records from boot the way Windows does.
+4. Alerts — a threshold per program, and a note when one crosses it.
+5. A report that compares today against the usual, so "unusual" needs no
    threshold set by hand.
-3. History drawn over hours, not just the last minute.
+6. History drawn over hours, not just the last minute.
 
 ## License
 

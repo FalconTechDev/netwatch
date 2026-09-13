@@ -24,7 +24,7 @@ use ratatui::widgets::{
 use crate::hidden::Hidden;
 use crate::procs;
 use crate::state::{Process, State};
-use crate::{bytes, etw, rate, trunc};
+use crate::{bytes, rate, source, trunc};
 
 /// A question the screen is waiting on before doing something irreversible.
 struct Confirm {
@@ -125,7 +125,7 @@ impl App {
 
 pub fn run() -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
-    let trace = etw::start(tx)?;
+    let trace = source::start(tx)?;
 
     // Everything the recorder saw since this machine started. Without it the
     // screen answers "since you pressed enter", which is almost never the
@@ -179,7 +179,7 @@ pub fn run() -> Result<(), String> {
 fn event_loop<B: Backend>(
     term: &mut Terminal<B>,
     app: &mut App,
-    rx: &mpsc::Receiver<etw::Event>,
+    rx: &mpsc::Receiver<crate::event::Event>,
 ) -> Result<(), String> {
     let mut last_tick = Instant::now();
 
@@ -422,6 +422,19 @@ fn draw(f: &mut Frame, app: &mut App) {
                 " netwatch ",
                 Style::new().bold().bg(Color::Cyan).fg(Color::Black),
             ),
+            // The failure that is otherwise invisible: nothing is recording,
+            // so nothing will be there to ask about later. It sits here, ahead
+            // of the totals, because the end of this line is what a narrow
+            // terminal cuts off — and a warning that only appears on wide
+            // screens is not a warning.
+            Span::styled(
+                if app.recording {
+                    String::new()
+                } else {
+                    format!(" NOT RECORDING — run: {} ·", crate::HOW_TO_RECORD)
+                },
+                Style::new().fg(Color::Red).bold(),
+            ),
             Span::styled(
                 format!(" ↓ {:<12}", rate(down)),
                 Style::new().fg(Color::Green).bold(),
@@ -450,17 +463,6 @@ fn draw(f: &mut Frame, app: &mut App) {
                     if app.by_rate { "rate" } else { "total" }
                 ),
                 Style::new().fg(Color::DarkGray),
-            ),
-            // The failure that is otherwise invisible: nothing is recording,
-            // so nothing will be there to ask about later. Said on the screen
-            // rather than left to be discovered the morning after.
-            Span::styled(
-                if app.recording {
-                    String::new()
-                } else {
-                    "  ·  NOT RECORDING — run:  netwatch service install".to_string()
-                },
-                Style::new().fg(Color::Red).bold(),
             ),
             // Never filter silently: a list that is quietly incomplete is
             // worse than one that is long.
@@ -884,7 +886,7 @@ fn draw_detail(f: &mut Frame, app: &App, pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::etw::{Dir, Proto};
+    use crate::event::{Dir, Proto};
     use std::net::{IpAddr, Ipv4Addr};
 
     /// Distinguishes one demo App from another, so their hidden-lists do not
@@ -901,7 +903,7 @@ mod tests {
             (4852, Dir::Sent, 4_002, [93, 184, 216, 34]),
             (2628, Dir::Sent, 4_574, [84, 17, 53, 155]),
         ] {
-            state.apply(crate::etw::Event::Transfer(crate::etw::Transfer {
+            state.apply(crate::event::Event::Transfer(crate::event::Transfer {
                 pid,
                 proto: Proto::Tcp,
                 dir,
@@ -912,7 +914,7 @@ mod tests {
         }
         // One peer the machine looked up, one it did not: both cases have to
         // render, and the unnamed one must not be left blank.
-        state.apply(crate::etw::Event::Named {
+        state.apply(crate::event::Event::Named {
             addr: IpAddr::V4(Ipv4Addr::new(140, 82, 114, 25)),
             host: "api.github.com".into(),
         });
@@ -926,7 +928,7 @@ mod tests {
                 (4852, [93, 184, 216, 34], 30_000),
                 (2628, [84, 17, 53, 155], if i == 9 { 900_000 } else { 200 }),
             ] {
-                state.apply(crate::etw::Event::Transfer(crate::etw::Transfer {
+                state.apply(crate::event::Event::Transfer(crate::event::Transfer {
                     pid,
                     proto: Proto::Tcp,
                     dir: Dir::Received,
@@ -994,6 +996,44 @@ mod tests {
             recording: true,
             started: Instant::now(),
         }
+    }
+
+    /// The warning must survive a narrow terminal, and must name a command
+    /// this build actually has.
+    ///
+    /// Both halves were wrong at once: the hint said `netwatch service
+    /// install` on every system, though that subcommand is compiled out on
+    /// Linux, and it sat at the end of the header where a 120-column terminal
+    /// cut it to `netwatch serv` — an instruction that was both unavailable
+    /// and unreadable.
+    #[test]
+    fn the_not_recording_warning_is_whole_and_runnable() {
+        let mut app = demo();
+        app.recording = false;
+
+        for width in [80, 100, 120, 200] {
+            let screen = render(&mut app, width, 20);
+            assert!(
+                screen.contains("NOT RECORDING"),
+                "the warning vanished at {width} columns:
+{screen}"
+            );
+            assert!(
+                screen.contains(crate::HOW_TO_RECORD),
+                "the command was cut at {width} columns; it must read                  {:?} in full:
+{screen}",
+                crate::HOW_TO_RECORD
+            );
+        }
+    }
+
+    /// Nothing should shout about recording when it is recording.
+    #[test]
+    fn a_recording_session_says_nothing_about_it() {
+        let mut app = demo();
+        app.recording = true;
+        let screen = render(&mut app, 120, 20);
+        assert!(!screen.contains("NOT RECORDING"), "{screen}");
     }
 
     fn render(app: &mut App, w: u16, h: u16) -> String {
