@@ -80,24 +80,40 @@ try {
     }
 
     Expand-Archive -Path $zip -DestinationPath $tmp -Force
-    $exe = Get-ChildItem -Path $tmp -Recurse -Filter 'netwatch.exe' | Select-Object -First 1
-    if (-not $exe) { throw 'The archive did not contain netwatch.exe.' }
 
-    # A running recorder holds the file open, so stop it before replacing the
-    # binary it is running from - and say so, rather than failing with a
-    # file-locked error nobody can act on.
+    # Two executables: the console one you type `netwatch` to run, and the
+    # windowless one that owns the tray icon. The tray one has no console by
+    # design, so it can start at logon without a black window ever appearing.
+    $wanted = @('netwatch.exe', 'netwatch-tray.exe')
+    $found = @{}
+    foreach ($name in $wanted) {
+        $hit = Get-ChildItem -Path $tmp -Recurse -Filter $name | Select-Object -First 1
+        if ($hit) { $found[$name] = $hit.FullName }
+    }
+    if (-not $found['netwatch.exe']) { throw 'The archive did not contain netwatch.exe.' }
+
+    # A running recorder or tray holds its file open, so stop both before
+    # replacing the binaries they run from - and say so, rather than failing
+    # with a file-locked error nobody can act on.
     if ($elevated) {
         schtasks /end /tn $Task 2>&1 | Out-Null
+        schtasks /end /tn "$Task-tray" 2>&1 | Out-Null
         Start-Sleep -Milliseconds 500
     }
+    taskkill /IM netwatch-tray.exe /F 2>&1 | Out-Null
 
     New-Item -ItemType Directory -Path $Dir -Force | Out-Null
-    try {
-        Copy-Item $exe.FullName (Join-Path $Dir 'netwatch.exe') -Force
-    } catch {
-        throw "Could not write to $Dir. Close any running netwatch and try again."
+    foreach ($name in $found.Keys) {
+        try {
+            Copy-Item $found[$name] (Join-Path $Dir $name) -Force
+        } catch {
+            throw "Could not write $name to $Dir. Close any running netwatch and try again."
+        }
+        Write-Host "Installed $Dir\$name"
     }
-    Write-Host "Installed $Dir\netwatch.exe"
+    if (-not $found['netwatch-tray.exe']) {
+        Write-Host 'This archive had no tray executable; the icon will be skipped.' -ForegroundColor Yellow
+    }
 }
 finally {
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue

@@ -114,10 +114,18 @@ behaviour of something else entirely. `netwatch service uninstall` removes it.
 
 The same command also puts an icon by the clock. The recorder is SYSTEM in
 session 0, which has no desktop and so can show nothing; the icon is a second,
-unelevated program (`netwatch tray`) registered to start at your logon, in your
-own session, reading the same log the recorder writes. It shows the totals since
-boot in its tooltip and offers the live view, a 12-hour report, and the log
-folder from its menu. Quitting it leaves recording untouched.
+unelevated program registered to start at your logon, in your own session,
+reading the same log the recorder writes. It shows the totals since boot in its
+tooltip and offers the live view, a 12-hour report, and the log folder from its
+menu. Quitting it leaves recording untouched.
+
+That icon is its own executable, `netwatch-tray.exe`, and that is deliberate.
+Windows decides whether a program gets a console window from a flag inside the
+executable, not from how it is started — so a console program launched at logon
+flashes a black window, and one that runs for as long as the tray does keeps it
+open the whole time. `netwatch-tray.exe` is built for the windows subsystem
+instead: it has no console, so nothing appears on screen when it starts. The
+console `netwatch.exe` is still what you type at a terminal.
 
 ## Everything since the machine came up
 

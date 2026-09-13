@@ -131,7 +131,12 @@ pub fn run() -> Result<(), String> {
         .build()
         .map_err(|e| format!("could not create the tray icon: {e}"))?;
 
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // This program is netwatch-tray.exe, which has no console; the live view
+    // and the report are the console program next to it. Launch that one, so
+    // they get the window they need to draw in.
+    let exe = std::env::current_exe()
+        .map_err(|e| e.to_string())?
+        .with_file_name("netwatch.exe");
     let menu_rx = MenuEvent::receiver();
     let mut last_refresh = std::time::Instant::now();
 
@@ -145,16 +150,21 @@ pub fn run() -> Result<(), String> {
                 return Ok(());
             } else if ev.id == open.id() {
                 // A new elevated console: the live view reads a kernel trace,
-                // which an unelevated process cannot open.
-                let _ = std::process::Command::new("powershell")
+                // which an unelevated process cannot open. The launcher itself
+                // is hidden, so the only window that appears is the view.
+                let _ = hidden_launcher("powershell")
                     .args([
                         "-NoProfile",
+                        "-WindowStyle",
+                        "Hidden",
                         "-Command",
                         &format!("Start-Process -Verb RunAs '{}'", exe.display()),
                     ])
                     .spawn();
             } else if ev.id == report.id() {
-                let _ = std::process::Command::new("cmd")
+                // `start` opens the visible console the report is read in; the
+                // `cmd /c` that calls it is hidden so nothing flashes first.
+                let _ = hidden_launcher("cmd")
                     .args([
                         "/c",
                         "start",
@@ -178,6 +188,23 @@ pub fn run() -> Result<(), String> {
 
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// A command that runs without a console window of its own. The programs it
+/// launches still get their windows; this only stops the short-lived launcher
+/// from flashing one of its own first.
+#[cfg(windows)]
+fn hidden_launcher(program: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut cmd = std::process::Command::new(program);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
+#[cfg(not(windows))]
+fn hidden_launcher(program: &str) -> std::process::Command {
+    std::process::Command::new(program)
 }
 
 /// Drain the thread's message queue. The icon is a window under the covers and

@@ -156,7 +156,7 @@ fn who() -> Result<String, String> {
 /// It is a separate task from the recorder because it is a separate program in
 /// a separate session: the recorder is SYSTEM in session 0, which has no
 /// desktop and so can show nothing; this is the interactive user, who can.
-fn tray_task_xml(exe: &str, user: &str) -> String {
+fn tray_task_xml(tray_exe: &str, user: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -198,12 +198,11 @@ fn tray_task_xml(exe: &str, user: &str) -> String {
   <Actions Context="Author">
     <Exec>
       <Command>{exe}</Command>
-      <Arguments>tray</Arguments>
     </Exec>
   </Actions>
 </Task>
 "#,
-        exe = escape(exe),
+        exe = escape(tray_exe),
         user = escape(user),
     )
 }
@@ -245,8 +244,13 @@ fn install(keep_days: u64, later: bool) -> Result<(), String> {
 
     // The tray icon, at logon, for whoever is installing. Failing to register
     // it must not fail the install: the recording is the point, and the icon
-    // is only how you glance at it.
-    let tray = who().and_then(|user| register(TRAY_TASK, &tray_task_xml(&exe, &user)));
+    // is only how you glance at it. It is the windowless second executable,
+    // sitting next to this one, so nothing appears on screen when it starts.
+    let tray_exe = std::path::Path::new(&exe)
+        .with_file_name("netwatch-tray.exe")
+        .display()
+        .to_string();
+    let tray = who().and_then(|user| register(TRAY_TASK, &tray_task_xml(&tray_exe, &user)));
 
     println!("Recording at every boot.");
     println!("  task     {TASK}, as SYSTEM, with no window");
@@ -378,7 +382,10 @@ mod tests {
     /// battery the icon would silently disappear on a laptop.
     #[test]
     fn the_tray_runs_at_logon_for_the_user_without_elevation() {
-        let xml = tray_task_xml(r"C:\Program Files\netwatch\netwatch.exe", r"HOME\user");
+        let xml = tray_task_xml(
+            r"C:\Program Files\netwatch\netwatch-tray.exe",
+            r"HOME\user",
+        );
         assert!(xml.contains("<LogonTrigger>"), "it starts at logon");
         assert!(
             xml.contains(r"<UserId>HOME\user</UserId>"),
@@ -388,7 +395,14 @@ mod tests {
             xml.contains("<RunLevel>LeastPrivilege</RunLevel>"),
             "no elevation"
         );
-        assert!(xml.contains("<Arguments>tray</Arguments>"));
+        assert!(
+            xml.contains(r"<Command>C:\Program Files\netwatch\netwatch-tray.exe</Command>"),
+            "it runs the windowless tray executable: {xml}"
+        );
+        assert!(
+            !xml.contains("<Arguments>"),
+            "the tray executable needs no subcommand"
+        );
         assert!(xml.contains("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"));
         assert!(!xml.contains("BootTrigger"), "the tray is not a boot task");
     }
