@@ -83,17 +83,27 @@ fn decode_start(record: &EventRecord, locator: &SchemaLocator) -> Option<Start> 
     let parent: u32 = parser.try_parse("ParentProcessID").unwrap_or(0);
     let image: String = parser.try_parse("ImageName").ok()?;
 
+    let name = image
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(&image)
+        .to_string();
+
     Some(Start {
         pid,
         parent,
-        // The provider gives a device path; the file name is what anything
-        // else on the machine calls the program.
-        name: image
-            .rsplit(['\\', '/'])
-            .next()
-            .unwrap_or(&image)
-            .to_string(),
+        // The file name is what anything else on the machine calls the
+        // program; the whole path is where it actually lives, which is the
+        // more interesting of the two.
+        name,
         parent_name: String::new(),
+        // The provider gives a device path, which names the same file by a
+        // route nobody recognises. Turned back into a drive letter here.
+        path: crate::procs::drive_path(&image),
+        // Not carried by the event, so it is read from the process itself
+        // while it is still there to read.
+        cmdline: crate::procs::command_line(pid),
+        user: String::new(),
     })
 }
 

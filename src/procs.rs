@@ -350,6 +350,175 @@ pub fn is_critical(name: &str) -> bool {
     CRITICAL.contains(&n.as_str())
 }
 
+/// A device path as the kernel writes it, turned back into one a person
+/// recognises: `\\Device\\HarddiskVolume4\\Windows\\notepad.exe` becomes
+/// `C:\\Windows\\notepad.exe`.
+///
+/// Kernel events name files this way, and the same file under two different
+/// names is the sort of thing that makes a person doubt the tool rather than
+/// the file. Anything that is already an ordinary path is left alone, and a
+/// device with no drive letter is left as it is rather than guessed at.
+#[cfg(windows)]
+pub fn drive_path(path: &str) -> String {
+    use windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW;
+
+    if !path.starts_with(r"\Device\") {
+        return path.to_string();
+    }
+
+    for letter in b'C'..=b'Z' {
+        let name: Vec<u16> = [letter as u16, u16::from(b':'), 0].to_vec();
+        let mut target = [0u16; 260];
+        // SAFETY: both buffers are valid for the lengths passed, and the call
+        // only writes into `target`.
+        let n = unsafe { QueryDosDeviceW(name.as_ptr(), target.as_mut_ptr(), target.len() as u32) };
+        if n == 0 {
+            continue;
+        }
+        let device =
+            String::from_utf16_lossy(&target[..target.iter().position(|c| *c == 0).unwrap_or(0)]);
+        if device.is_empty() {
+            continue;
+        }
+        if let Some(rest) = path.strip_prefix(&device) {
+            return format!("{}:{}", letter as char, rest);
+        }
+    }
+    path.to_string()
+}
+
+#[cfg(not(windows))]
+pub fn drive_path(path: &str) -> String {
+    path.to_string()
+}
+
+/// The whole command a process was given, arguments and all.
+///
+/// Windows keeps this in the process's own memory rather than anywhere the
+/// kernel will report it, so it is read out of the PEB. The two offsets are
+/// hard-coded because they are part of the 64-bit ABI every program on the
+/// machine already depends on; they have not moved since Windows XP.
+///
+/// Empty when the process has already exited or will not be opened, which is
+/// ordinary: this races a program that lives for a few milliseconds, and
+/// losing that race is better than holding a handle open to win it.
+#[cfg(windows)]
+pub fn command_line(pid: u32) -> String {
+    use std::ffi::c_void;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+    };
+
+    /// `PEB.ProcessParameters` on 64-bit Windows.
+    const PEB_PARAMETERS: usize = 0x20;
+    /// `RTL_USER_PROCESS_PARAMETERS.CommandLine`, a UNICODE_STRING.
+    const PARAMS_COMMANDLINE: usize = 0x70;
+    /// A command line longer than this is not worth the read; the shape of it
+    /// is already clear by then.
+    const MAX: usize = 2048;
+
+    #[repr(C)]
+    struct ProcessBasicInformation {
+        exit_status: i32,
+        _pad: i32,
+        peb: usize,
+        affinity: usize,
+        base_priority: i32,
+        _pad2: i32,
+        unique_process_id: usize,
+        inherited_from: usize,
+    }
+
+    // ntdll's own declaration. It is not in windows-sys's generated surface,
+    // and this is the documented way to reach the PEB of another process.
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtQueryInformationProcess(
+            handle: HANDLE,
+            class: i32,
+            info: *mut c_void,
+            len: u32,
+            written: *mut u32,
+        ) -> i32;
+    }
+
+    // SAFETY: every pointer below is to a local of the right size, and each
+    // read is checked before its result is used. The handle is closed on
+    // every path out.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, pid);
+        if handle.is_null() {
+            return String::new();
+        }
+
+        let mut info: ProcessBasicInformation = std::mem::zeroed();
+        let mut written = 0u32;
+        let status = NtQueryInformationProcess(
+            handle,
+            0, // ProcessBasicInformation
+            (&raw mut info).cast(),
+            size_of::<ProcessBasicInformation>() as u32,
+            &raw mut written,
+        );
+        if status != 0 || info.peb == 0 {
+            CloseHandle(handle);
+            return String::new();
+        }
+
+        let read = |at: usize, into: *mut c_void, len: usize| -> bool {
+            let mut got = 0usize;
+            ReadProcessMemory(handle, at as *const c_void, into, len, &raw mut got) != 0
+                && got == len
+        };
+
+        let mut params: usize = 0;
+        if !read(
+            info.peb + PEB_PARAMETERS,
+            (&raw mut params).cast(),
+            size_of::<usize>(),
+        ) || params == 0
+        {
+            CloseHandle(handle);
+            return String::new();
+        }
+
+        // UNICODE_STRING: a length in bytes, a capacity, then the pointer.
+        let mut length: u16 = 0;
+        let mut buffer: usize = 0;
+        let ok = read(
+            params + PARAMS_COMMANDLINE,
+            (&raw mut length).cast(),
+            size_of::<u16>(),
+        ) && read(
+            params + PARAMS_COMMANDLINE + size_of::<usize>(),
+            (&raw mut buffer).cast(),
+            size_of::<usize>(),
+        );
+        if !ok || buffer == 0 || length == 0 {
+            CloseHandle(handle);
+            return String::new();
+        }
+
+        let chars = (length as usize / 2).min(MAX);
+        let mut wide = vec![0u16; chars];
+        let ok = read(buffer, wide.as_mut_ptr().cast(), chars * 2);
+        CloseHandle(handle);
+
+        if ok {
+            String::from_utf16_lossy(&wide).trim().to_string()
+        } else {
+            String::new()
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn command_line(_pid: u32) -> String {
+    String::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

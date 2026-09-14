@@ -744,24 +744,136 @@ fn draw_confirm(f: &mut Frame, c: &Confirm) {
 fn draw_detail(f: &mut Frame, app: &App, pid: u32) {
     let Some(p) = app.state.get(pid) else { return };
 
-    // One row per field, plus the blank line before the peers. Sized from the
-    // field list rather than guessed: adding a field and forgetting this is
-    // how the last one silently disappeared.
-    const FIELDS: u16 = 8;
+    let dim = Style::new().fg(Color::DarkGray);
+    let unknown = Style::new().fg(Color::Yellow);
+    let field = |label: &str, value: &str, empty: &str| {
+        let (text, style) = if value.is_empty() {
+            (empty.to_string(), unknown)
+        } else {
+            (value.to_string(), Style::new())
+        };
+        Line::from(vec![
+            Span::styled(format!("{label:<11}"), dim),
+            Span::styled(text, style),
+        ])
+    };
+
+    let mut peers: Vec<_> = p.peers.values().collect();
+    peers.sort_by_key(|p| std::cmp::Reverse(p.traffic.total()));
+
+    // The lines are built before the card is sized, and the card is sized from
+    // them. Three times now a fixed height has quietly pushed the last field —
+    // or the whole peer table — off the bottom when something was added; this
+    // is the arrangement in which that cannot happen.
+    let origin = app.state.origin(pid);
+    let mut fields: Vec<Line> = vec![
+        // Identity first, and the pid at the top of it: it is what every other
+        // tool on the machine wants in order to talk about this program, and
+        // it should not have to be found in the middle of a line of byte
+        // counts.
+        Line::from(vec![
+            Span::styled(format!("{:<11}", "pid"), dim),
+            Span::styled(p.pid.to_string(), Style::new().bold()),
+            Span::styled(format!("   {} peers, {}", peers.len(), protocols(p)), dim),
+        ]),
+        field(
+            "described",
+            &p.info.description,
+            "no description in the file",
+        ),
+        field(
+            "publisher",
+            &p.info.company,
+            "no publisher named in the file",
+        ),
+        field("path", &p.info.path, "could not be read"),
+    ];
+
+    // The command is often the whole story. A program called `sh` says
+    // nothing; `sh -c "curl http://… | sh"` says everything, and the name is
+    // identical in both cases.
+    if let Some(o) = origin.filter(|o| !o.cmdline.is_empty()) {
+        fields.push(field("command", &o.cmdline, ""));
+    }
+    if let Some(o) = origin.filter(|o| !o.user.is_empty()) {
+        fields.push(field("ran as", &o.user, ""));
+    }
+
+    // What set this off, and what it set off in turn. Both are shown as "not
+    // seen" rather than left out when netwatch was not running at the time: an
+    // absent line reads as "nothing", and nothing is a different claim from
+    // "this was already running".
+    fields.push(Line::from(vec![
+        Span::styled(format!("{:<11}", "started by"), dim),
+        match app.state.ancestry(pid).first() {
+            Some((ppid, name)) => Span::raw(format!("{name} ({ppid})")),
+            None => Span::styled("not seen starting", unknown),
+        },
+    ]));
+
+    let kids = app.state.children(pid);
+    if kids.is_empty() {
+        fields.push(Line::from(vec![
+            Span::styled(format!("{:<11}", "it started"), dim),
+            Span::styled("nothing, while watched", dim),
+        ]));
+    } else {
+        // One child per line, with where it ran from. A name alone is the
+        // least interesting half: `sh` from /usr/bin and `sh` from /tmp are
+        // the same word and not the same event.
+        const SHOWN: usize = 4;
+        for (n, (kid, o)) in kids.iter().take(SHOWN).enumerate() {
+            fields.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<11}", if n == 0 { "it started" } else { "" }),
+                    dim,
+                ),
+                Span::raw(format!("{} ({kid})", o.name)),
+                Span::styled(
+                    if o.path.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  {}", o.path)
+                    },
+                    dim,
+                ),
+            ]));
+        }
+        let more = kids.len().saturating_sub(SHOWN);
+        if more > 0 {
+            fields.push(Line::from(Span::styled(
+                format!("{:<11}and {more} more", ""),
+                dim,
+            )));
+        }
+    }
+
+    fields.push(Line::from(vec![
+        Span::styled(format!("{:<11}", "seen"), dim),
+        Span::raw(format!(
+            "{} ago, first {} into this run",
+            ago(p.last_seen.elapsed()),
+            ago(p.first_seen.duration_since(app.started))
+        )),
+    ]));
+    fields.push(Line::from(vec![
+        Span::styled(format!("{:<11}", "traffic"), dim),
+        Span::styled(bytes(p.traffic.received), Style::new().fg(Color::Green)),
+        Span::styled(" down · ", dim),
+        Span::styled(bytes(p.traffic.sent), Style::new().fg(Color::Blue)),
+        Span::styled(" up", dim),
+    ]));
 
     let area = f.area();
     let w = area.width.saturating_sub(6).clamp(40, 100);
-    // The card has to fit its fields, the blank line after them, its borders,
-    // and enough of the peer table to be worth opening at all. Deriving the
-    // height from the field count is what stops a new field from quietly
-    // pushing the peers off the bottom — which is exactly what adding the two
-    // lineage lines did when this was a constant.
-    const MIN_H: u16 = FIELDS + 1 + 2 + 3;
+    // Room for every field, the blank line after them, the borders, and
+    // enough of the peer table to be worth opening at all.
+    let wanted = fields.len() as u16 + 1 + 2 + 3;
     let h = area
         .height
         .saturating_sub(4)
-        .clamp(MIN_H, 26)
-        // On a screen too short for even that, the card takes what there is
+        .clamp(wanted.min(26), 30)
+        // On a screen too short even for that, the card takes what there is
         // rather than drawing past the bottom.
         .min(area.height);
     let popup = Rect {
@@ -770,9 +882,6 @@ fn draw_detail(f: &mut Frame, app: &App, pid: u32) {
         width: w,
         height: h,
     };
-
-    let mut peers: Vec<_> = p.peers.values().collect();
-    peers.sort_by_key(|p| std::cmp::Reverse(p.traffic.total()));
 
     f.render_widget(Clear, popup);
     f.render_widget(
@@ -790,91 +899,13 @@ fn draw_detail(f: &mut Frame, app: &App, pid: u32) {
         vertical: 1,
         horizontal: 1,
     });
-    let parts = Layout::vertical([Constraint::Length(FIELDS + 1), Constraint::Min(1)]).split(inner);
+    let parts = Layout::vertical([
+        Constraint::Length(fields.len() as u16 + 1),
+        Constraint::Min(1),
+    ])
+    .split(inner);
 
-    let dim = Style::new().fg(Color::DarkGray);
-    let unknown = Style::new().fg(Color::Yellow);
-    let field = |label: &'static str, value: &str, empty: &'static str| {
-        let (text, style) = if value.is_empty() {
-            (empty.to_string(), unknown)
-        } else {
-            (value.to_string(), Style::new())
-        };
-        Line::from(vec![
-            Span::styled(format!("{label:<11}"), dim),
-            Span::styled(text, style),
-        ])
-    };
-
-    f.render_widget(
-        Paragraph::new(vec![
-            // Identity first, and the pid at the top of it: it is what every
-            // other tool on the machine wants in order to talk about this
-            // program, and it should not have to be found in the middle of a
-            // line of byte counts.
-            Line::from(vec![
-                Span::styled(format!("{:<11}", "pid"), dim),
-                Span::styled(p.pid.to_string(), Style::new().bold()),
-                Span::styled(format!("   {} peers, {}", peers.len(), protocols(p)), dim),
-            ]),
-            field(
-                "described",
-                &p.info.description,
-                "no description in the file",
-            ),
-            field(
-                "publisher",
-                &p.info.company,
-                "no publisher named in the file",
-            ),
-            field("path", &p.info.path, "could not be read"),
-            // What set this off, and what it set off in turn. Both are shown
-            // as "not seen" rather than left out when netwatch was not running
-            // at the time: an absent line reads as "nothing", and nothing is a
-            // different claim from "this was already running".
-            Line::from(vec![
-                Span::styled(format!("{:<11}", "started by"), dim),
-                match app.state.ancestry(pid).first() {
-                    Some((ppid, name)) => Span::raw(format!("{name} ({ppid})")),
-                    None => Span::styled("not seen starting", unknown),
-                },
-            ]),
-            Line::from(vec![Span::styled(format!("{:<11}", "it started"), dim), {
-                let kids = app.state.children(pid);
-                if kids.is_empty() {
-                    Span::styled("nothing, while watched", dim)
-                } else {
-                    let names: Vec<String> = kids
-                        .iter()
-                        .take(4)
-                        .map(|(pid, name)| format!("{name} ({pid})"))
-                        .collect();
-                    let more = kids.len().saturating_sub(names.len());
-                    Span::raw(if more == 0 {
-                        names.join(", ")
-                    } else {
-                        format!("{}, and {more} more", names.join(", "))
-                    })
-                }
-            }]),
-            Line::from(vec![
-                Span::styled(format!("{:<11}", "seen"), dim),
-                Span::raw(format!(
-                    "{} ago, first {} into this run",
-                    ago(p.last_seen.elapsed()),
-                    ago(p.first_seen.duration_since(app.started))
-                )),
-            ]),
-            Line::from(vec![
-                Span::styled(format!("{:<11}", "traffic"), dim),
-                Span::styled(bytes(p.traffic.received), Style::new().fg(Color::Green)),
-                Span::styled(" down · ", dim),
-                Span::styled(bytes(p.traffic.sent), Style::new().fg(Color::Blue)),
-                Span::styled(" up", dim),
-            ]),
-        ]),
-        parts[0],
-    );
+    f.render_widget(Paragraph::new(fields), parts[0]);
 
     let rows: Vec<Row> = peers
         .iter()
@@ -1089,6 +1120,9 @@ mod tests {
                 parent: 4100,
                 name: "firefox.exe".into(),
                 parent_name: "explorer.exe".into(),
+                path: r"C:\Program Files\Mozilla Firefox\firefox.exe".into(),
+                cmdline: "firefox.exe --no-remote -P work".into(),
+                user: r"HOME\user".into(),
             }));
         app.state
             .apply(crate::event::Event::Started(crate::event::Start {
@@ -1096,12 +1130,26 @@ mod tests {
                 parent: 6124,
                 name: "crashreporter.exe".into(),
                 parent_name: "firefox.exe".into(),
+                path: r"C:\Users\you\AppData\Local\Temp\crashreporter.exe".into(),
+                cmdline: "crashreporter.exe --submit".into(),
+                user: r"HOME\user".into(),
             }));
         app.expanded = Some(6124);
         let screen = render(&mut app, 110, 30);
 
         assert!(screen.contains("explorer.exe (4100)"), "{screen}");
         assert!(screen.contains("crashreporter.exe (9001)"), "{screen}");
+        // The command tells two programs of the same name apart, and a
+        // child's path tells a temp directory from Program Files. Both are
+        // the reason for opening this card at all.
+        assert!(
+            screen.contains("--no-remote"),
+            "the command is missing:\n{screen}"
+        );
+        assert!(
+            screen.contains(r"Temp\crashreporter.exe"),
+            "the child's path is missing:\n{screen}"
+        );
     }
 
     /// The warning must survive a narrow terminal, and must name a command

@@ -104,12 +104,17 @@ pub struct State {
     pub events: u64,
 }
 
-/// Where one program came from.
+/// Where one program came from, and what it was told to do.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Origin {
     pub parent: u32,
     pub name: String,
     pub parent_name: String,
+    /// Where it was run from.
+    pub path: String,
+    /// The whole command, arguments and all.
+    pub cmdline: String,
+    pub user: String,
 }
 
 impl Default for State {
@@ -162,6 +167,9 @@ impl State {
                 parent: s.parent,
                 name: s.name,
                 parent_name: s.parent_name,
+                path: s.path,
+                cmdline: s.cmdline,
+                user: s.user,
             },
         );
     }
@@ -198,12 +206,12 @@ impl State {
     ///
     /// Sorted by pid, which is the order they were created in, so a list of
     /// children reads as a sequence of events rather than as a set.
-    pub fn children(&self, pid: u32) -> Vec<(u32, String)> {
-        let mut kids: Vec<(u32, String)> = self
+    pub fn children(&self, pid: u32) -> Vec<(u32, &Origin)> {
+        let mut kids: Vec<(u32, &Origin)> = self
             .starts
             .iter()
             .filter(|(child, origin)| origin.parent == pid && **child != pid)
-            .map(|(child, origin)| (*child, origin.name.clone()))
+            .map(|(child, origin)| (*child, origin))
             .collect();
         kids.sort_unstable_by_key(|(pid, _)| *pid);
         kids
@@ -559,6 +567,9 @@ mod tests {
             parent,
             name: name.into(),
             parent_name: parent_name.into(),
+            path: format!("/usr/bin/{name}"),
+            cmdline: name.into(),
+            user: "root".into(),
         })
     }
 
@@ -605,8 +616,13 @@ mod tests {
         s.apply(started(400, 100, "wget", "sh"));
         s.apply(started(600, 999, "unrelated", "other"));
 
+        let kids: Vec<(u32, String)> = s
+            .children(100)
+            .into_iter()
+            .map(|(pid, o)| (pid, o.name.clone()))
+            .collect();
         assert_eq!(
-            s.children(100),
+            kids,
             vec![(400, "wget".to_string()), (500, "curl".to_string())]
         );
         assert!(s.children(42).is_empty());

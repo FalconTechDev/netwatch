@@ -49,6 +49,11 @@ pub enum Event {
 }
 
 /// One program starting, as the kernel reported it.
+///
+/// Everything here is gathered at the moment of the start, because most of it
+/// cannot be gathered afterwards: a program that runs for a tenth of a second
+/// is exactly the one worth knowing about, and by the time anything asks, its
+/// command line and its path are gone.
 #[derive(Clone, Debug)]
 pub struct Start {
     pub pid: u32,
@@ -57,6 +62,18 @@ pub struct Start {
     /// looked up afterwards, because it may not last long enough to be found.
     pub name: String,
     pub parent_name: String,
+    /// Where it was run from. The single most useful fact about a program:
+    /// `svchost.exe` in System32 is the operating system, and the same name
+    /// from a temp directory is not.
+    pub path: String,
+    /// The whole command, arguments and all.
+    ///
+    /// Often this *is* the story. A program called `sh` says nothing; `sh -c
+    /// "curl http://… | sh"` says everything, and the name is the same in both
+    /// cases.
+    pub cmdline: String,
+    /// Who it runs as. Empty where it could not be read.
+    pub user: String,
 }
 
 /// One send or receive, as the kernel reported it.

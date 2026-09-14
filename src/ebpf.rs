@@ -341,21 +341,114 @@ fn decode_start(raw: &[u8]) -> Option<Event> {
     let comm = String::from_utf8_lossy(&s.comm[..len]).into_owned();
 
     let (parent, parent_name) = parent_of(s.pid);
+    let path = exe_path(s.pid).unwrap_or_default();
     Some(Event::Started(Start {
         // The path is preferred where it can still be read: the kernel cuts a
         // name at fifteen characters, so `comm` alone turns two different
         // programs into the same one.
-        name: exe_name(s.pid).unwrap_or(comm),
+        name: file_name(&path).unwrap_or(comm),
         pid: s.pid,
         parent,
         parent_name,
+        path,
+        cmdline: cmdline_of(s.pid),
+        user: user_of(s.pid),
     }))
+}
+
+/// Where a running process was run from, or nothing if it has already gone.
+fn exe_path(pid: u32) -> Option<String> {
+    let path = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    Some(path.to_string_lossy().into_owned())
+}
+
+fn file_name(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    Some(
+        std::path::Path::new(path)
+            .file_name()?
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 /// The file name of a running process, or nothing if it has already gone.
 fn exe_name(pid: u32) -> Option<String> {
-    let path = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
-    Some(path.file_name()?.to_string_lossy().into_owned())
+    file_name(&exe_path(pid)?)
+}
+
+/// The whole command a process was given.
+///
+/// `/proc/<pid>/cmdline` separates the arguments with NUL bytes, which is what
+/// makes it trustworthy: an argument containing a space is still one argument,
+/// where a command line reassembled from a string is a guess.
+fn cmdline_of(pid: u32) -> String {
+    /// Long enough to show the shape of any command worth reading.
+    const MAX: usize = 2048;
+
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for arg in raw.split(|b| *b == 0).filter(|a| !a.is_empty()) {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&String::from_utf8_lossy(arg));
+        if out.len() >= MAX {
+            out.truncate(MAX);
+            out.push('…');
+            break;
+        }
+    }
+    out
+}
+
+/// Who a process runs as, by name where `/etc/passwd` knows it.
+///
+/// The real uid rather than the effective one: it says who set this off, which
+/// is the question, where the effective uid says what it is allowed to do.
+fn user_of(pid: u32) -> String {
+    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return String::new();
+    };
+    let Some(uid) = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.parse::<u32>().ok())
+    else {
+        return String::new();
+    };
+    user_name(uid).unwrap_or_else(|| format!("uid {uid}"))
+}
+
+/// A user id turned into a name, from `/etc/passwd`.
+///
+/// Read once and kept: it is the same answer every time, and this is called
+/// for every program that starts.
+fn user_name(uid: u32) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+
+    static USERS: OnceLock<HashMap<u32, String>> = OnceLock::new();
+    let users = USERS.get_or_init(|| {
+        let mut map = HashMap::new();
+        if let Ok(passwd) = std::fs::read_to_string("/etc/passwd") {
+            for line in passwd.lines() {
+                let mut f = line.split(':');
+                if let (Some(name), Some(_), Some(id)) = (f.next(), f.next(), f.next())
+                    && let Ok(id) = id.parse::<u32>()
+                {
+                    map.insert(id, name.to_owned());
+                }
+            }
+        }
+        map
+    });
+    users.get(&uid).cloned()
 }
 
 /// Who started a process, from `/proc/<pid>/status`.

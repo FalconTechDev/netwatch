@@ -137,9 +137,19 @@ fn top(seconds: u64, by_total: bool) -> Result<(), String> {
             bytes(p.traffic.total()),
             p.peers.len()
         );
-        // What set it off, where that was seen. Indented under the program
-        // rather than given a column, because the chain has no fixed width and
-        // most rows have none at all.
+        // The command and the chain, indented under the program rather than
+        // given columns: neither has a fixed width, and most rows have
+        // neither. The command comes first because it is usually the whole
+        // story — two programs of the same name are told apart by nothing
+        // else.
+        if let Some(o) = st.origin(p.pid) {
+            if !o.cmdline.is_empty() {
+                println!("{:<26} {}", "", trunc(&o.cmdline, 90));
+            }
+            if !o.path.is_empty() && o.path != p.info.path {
+                println!("{:<26} from {}", "", o.path);
+            }
+        }
         let chain = st.ancestry(p.pid);
         if !chain.is_empty() {
             let path: Vec<String> = chain
