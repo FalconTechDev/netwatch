@@ -39,9 +39,9 @@ use aya_ebpf_bindings::bindings::bpf_pidns_info;
 use aya_ebpf_bindings::helpers::bpf_get_ns_current_pid_tgid;
 
 use netwatch_common::{
-    AF_INET, AF_INET6, COMM_MAX, DIR_RECEIVED, DIR_SENT, FAMILY_V4, FAMILY_V6, HOST_MAX, KIND_FILE,
-    KIND_NAME, KIND_START, KIND_TRANSFER, PATH_MAX, PROTO_TCP, PROTO_UDP, RawFile, RawName,
-    RawStart, RawTransfer, sock,
+    AF_INET, AF_INET6, COMM_MAX, DIR_RECEIVED, DIR_SENT, DNS_MAX, FAMILY_V4, FAMILY_V6, HOST_MAX,
+    KIND_DNS, KIND_FILE, KIND_NAME, KIND_START, KIND_TRANSFER, PATH_MAX, PROTO_TCP, PROTO_UDP,
+    RawDns, RawFile, RawName, RawStart, RawTransfer, sock,
 };
 
 /// The pid namespace to report process ids in, as a device number and inode,
@@ -141,7 +141,77 @@ pub fn skb_consume_udp(ctx: ProbeContext) -> u32 {
         return 0;
     }
     emit(sk, len as u64, DIR_RECEIVED, PROTO_UDP);
+
+    // A reply from port 53 is the only place a name exists for a program that
+    // carries its own resolver instead of using the C library's.
+    if let Some(skb) = ctx.arg::<u64>(1) {
+        sniff_dns(sk, skb);
+    }
     0
+}
+
+/// The port a name is asked of.
+const DNS_PORT: u16 = 53;
+
+/// Copy a DNS reply out to be read.
+///
+/// Only replies, and only whole. Nothing is parsed here: walking names and
+/// following compression pointers is what the verifier fights hardest and what
+/// is easiest to get wrong, so the bytes go up as they arrived.
+fn sniff_dns(sk: u64, skb: u64) {
+    let (_, port, _) = peer(sk);
+    if port != DNS_PORT {
+        return;
+    }
+
+    let Some(&off_data) = SOCK.get(sock::SKB_DATA) else {
+        return;
+    };
+    if off_data == sock::NO_FIELD {
+        return;
+    }
+
+    // SAFETY: read through the helper, which faults safely, from a pointer the
+    // kernel passed as this call's own argument.
+    let Ok(data) = (unsafe { bpf_probe_read_kernel::<u64>((skb + off_data) as *const u64) }) else {
+        return;
+    };
+    if data == 0 {
+        return;
+    }
+
+    let Some(mut entry) = EVENTS.reserve::<RawDns>(0) else {
+        return;
+    };
+
+    // Filled in place rather than built and copied: a BPF program has 512
+    // bytes of stack in total, and a reply is exactly that size. A local
+    // buffer for it does not fit and never could.
+    let out = entry.as_mut_ptr();
+    // SAFETY: the ring buffer reserved room for exactly this type, every field
+    // is written before the entry is submitted, and the payload is read
+    // through the helper, which faults safely.
+    let ok = unsafe {
+        (*out).kind = KIND_DNS;
+        (*out)._pad = [0u8; 1];
+        (*out).len = DNS_MAX as u16;
+        (*out).pid = current_tgid();
+        // A short reply leaves the rest zero, and the reader stops at the end
+        // of the records it can actually see.
+        // From `data` itself: by the time this is called the UDP header has
+        // already been pulled, so the reply begins there. That was measured
+        // rather than reasoned about — the copy in `udp_recvmsg` is made from
+        // eight bytes in, which suggests the opposite and is not what the
+        // bytes show. The reader tries both positions in case a kernel does
+        // it the other way.
+        bpf_probe_read_kernel_buf(data as *const u8, &mut (*out).data).is_ok()
+    };
+
+    if ok {
+        entry.submit(0);
+    } else {
+        entry.discard(0);
+    }
 }
 
 /// Put one transfer on the ring buffer, or drop it if there is no room.

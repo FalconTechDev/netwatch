@@ -23,8 +23,8 @@ use aya::programs::uprobe::UProbeScope;
 use aya::programs::{KProbe, UProbe};
 
 use netwatch_common::{
-    DIR_SENT, FAMILY_V6, KIND_FILE, KIND_NAME, KIND_START, KIND_TRANSFER, PROTO_UDP, RawFile,
-    RawName, RawStart, RawTransfer, sock,
+    DIR_SENT, FAMILY_V6, KIND_DNS, KIND_FILE, KIND_NAME, KIND_START, KIND_TRANSFER, PROTO_UDP,
+    RawDns, RawFile, RawName, RawStart, RawTransfer, sock,
 };
 
 use crate::event::{Dir, Event, Proto, Start, Transfer};
@@ -251,6 +251,14 @@ fn tell_kernel_where_its_fields_are(ebpf: &mut aya::Ebpf) {
         .map(u64::from)
         .unwrap_or(netwatch_common::sock::NO_FIELD);
 
+    // Where a received packet's bytes begin. Without it a reply cannot be
+    // read, and programs that carry their own resolver keep unnamed peers —
+    // which is a smaller loss than reading the wrong memory.
+    let skb_data = btf
+        .offset_of("sk_buff", &["data"])
+        .map(u64::from)
+        .unwrap_or(netwatch_common::sock::NO_FIELD);
+
     let mut map: aya::maps::Array<_, u64> = match ebpf.map_mut("SOCK").map(TryInto::try_into) {
         Some(Ok(m)) => m,
         _ => {
@@ -264,6 +272,7 @@ fn tell_kernel_where_its_fields_are(ebpf: &mut aya::Ebpf) {
         (sock::DADDR, daddr as u64),
         (sock::DPORT, dport as u64),
         (sock::DADDR6, daddr6),
+        (sock::SKB_DATA, skb_data),
     ];
     for (slot, value) in slots {
         if let Err(e) = map.set(slot, value, 0) {
@@ -312,6 +321,14 @@ fn read_loop(mut ring: RingBuf<aya::maps::MapData>, tx: Sender<Event>, stop: Arc
         let mut moved = false;
         while let Some(item) = ring.next() {
             moved = true;
+            if item.first().copied() == Some(KIND_DNS) {
+                for ev in decode_dns(&item) {
+                    if tx.send(ev).is_err() {
+                        return;
+                    }
+                }
+                continue;
+            }
             if let Some(ev) = decode(&item) {
                 // The receiver going away means the program is shutting down;
                 // there is nobody left to tell.
@@ -337,8 +354,41 @@ fn decode(raw: &[u8]) -> Option<Event> {
         KIND_NAME => decode_name(raw),
         KIND_START => decode_start(raw),
         KIND_FILE => decode_file(raw),
+        // A reply carries many answers, and `decode` returns one event, so the
+        // caller handles this kind itself.
         _ => None,
     }
+}
+
+/// Every name-to-address pairing in a captured DNS reply.
+///
+/// Separate from `decode` because one reply commonly answers with several
+/// addresses, and collapsing them to one would leave most of a CDN unnamed.
+fn decode_dns(raw: &[u8]) -> Vec<Event> {
+    if raw.len() < size_of::<RawDns>() {
+        return Vec::new();
+    }
+    // SAFETY: length checked above; the kernel side writes exactly this
+    // `repr(C)` type. `read_unaligned` because the ring buffer only promises
+    // 8-byte alignment of the record start.
+    let d: RawDns = unsafe { std::ptr::read_unaligned(raw.as_ptr().cast()) };
+
+    let len = (d.len as usize).min(d.data.len());
+    let payload = &d.data[..len];
+
+    // Where the reply begins relative to what the kernel handed over differs
+    // by kernel path: here the UDP header has already been pulled, and on
+    // another it may not have been. Both are tried because the parser is
+    // strict — it checks the reply bit, the response code and the record
+    // counts — so a wrong start yields nothing rather than nonsense.
+    let mut got = crate::dns::wire::answers(payload);
+    if got.is_empty() && len > 8 {
+        got = crate::dns::wire::answers(&payload[8..]);
+    }
+
+    got.into_iter()
+        .map(|(host, addr)| Event::Named { addr, host })
+        .collect()
 }
 
 /// A file a program opened for writing.

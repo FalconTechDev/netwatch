@@ -19,6 +19,7 @@ pub const KIND_TRANSFER: u8 = 0;
 pub const KIND_NAME: u8 = 1;
 pub const KIND_START: u8 = 2;
 pub const KIND_FILE: u8 = 3;
+pub const KIND_DNS: u8 = 4;
 
 pub const PROTO_TCP: u8 = 0;
 pub const PROTO_UDP: u8 = 1;
@@ -43,8 +44,10 @@ pub mod sock {
     pub const DADDR: u32 = 2;
     pub const DPORT: u32 = 3;
     pub const DADDR6: u32 = 4;
+    /// `sk_buff.data`, for reading a reply straight off the wire.
+    pub const SKB_DATA: u32 = 5;
     /// How many slots the map needs.
-    pub const SLOTS: u32 = 5;
+    pub const SLOTS: u32 = 6;
 
     /// Written in place of an offset for a field this kernel does not have,
     /// such as `skc_v6_daddr` on a build without IPv6. It has to be a value no
@@ -131,6 +134,29 @@ pub struct RawFile {
     pub _pad: [u8; 1],
     pub pid: u32,
     pub path: [u8; PATH_MAX],
+}
+
+/// The most of a DNS reply that is carried. 512 bytes is the classic limit
+/// for a reply over UDP, and a longer one is read as far as this goes: the
+/// answers near the start are the ones that matter.
+pub const DNS_MAX: usize = 512;
+
+/// A DNS reply, exactly as it arrived.
+///
+/// Carried raw rather than parsed in the kernel: reading it means walking
+/// variable-length names and following compression pointers, which is what the
+/// verifier fights hardest and what is easiest to get wrong. The kernel copies
+/// the bytes; the reader makes sense of them, under test.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RawDns {
+    /// Always `KIND_DNS`.
+    pub kind: u8,
+    pub _pad: [u8; 1],
+    /// How many bytes of `data` are used.
+    pub len: u16,
+    pub pid: u32,
+    pub data: [u8; DNS_MAX],
 }
 
 /// An address this machine looked up, and the name it asked for.
