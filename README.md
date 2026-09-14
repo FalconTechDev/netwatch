@@ -382,6 +382,26 @@ notice had stopped working. `tools/make-standalone.sh` and
 The Linux one must be run **as a file**, not piped into `sh`: it reads its own
 payload out of `$0`, and a pipe has no `$0` to read.
 
+### Building for ARM
+
+netwatch cross-compiles for 64-bit ARM:
+
+```sh
+rustup target add aarch64-unknown-linux-gnu
+sudo apt install gcc-aarch64-linux-gnu
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc   cargo build --release --target aarch64-unknown-linux-gnu
+```
+
+The eBPF half is built for the target's architecture, not the host's, which
+matters more than it sounds: a kprobe reads its arguments out of registers, and
+the registers differ between x86-64 and ARM. A program built with the wrong one
+would load, run, and report numbers taken from the wrong places — no error, just
+values that are not the values.
+
+No ARM binaries are published, because none has been run on ARM hardware. A
+traffic monitor that might be reading the wrong registers is worse than no
+traffic monitor, and "it compiled" is not the same claim as "it works".
+
 ## How Linux is asked
 
 ETW has no equivalent here, so the question is put to the kernel directly, with
@@ -428,13 +448,21 @@ Names come from `/proc/<pid>/exe` rather than from `comm`: the kernel truncates
 `comm` to fifteen characters, and two different programs would quietly become
 the same one.
 
-Peer **names** are read where the lookup happens, with a pair of probes on the
-C library's `getaddrinfo` — the name going in, the addresses coming out. That
-is the same promise the Windows side makes by reading the machine's own DNS
-answers: a name on screen is one a program here actually asked for, never a
-reverse lookup. A program that carries its own resolver instead of using the C
-library — a statically linked Go binary, most obviously — is not seen, and its
-peers stay addresses rather than acquiring a name from somewhere else.
+Peer **names** come from two places. A pair of probes on the C library's
+`getaddrinfo` catches the name going in and the addresses coming out; and for
+programs that never call it — a statically linked Go binary carries its own
+resolver — the DNS reply itself is read off the wire.
+
+The kernel copies the reply and nothing more. Making sense of it means walking
+variable-length names and following compression pointers, which is what the
+verifier fights hardest and what is easiest to get wrong, so that is done in
+userspace where it is covered by tests: a pointer that points at itself, a
+length that claims more than the packet holds, two hundred packets of noise.
+Nothing there trusts its input — it is a packet from the network, and every
+length in it is a number somebody else chose.
+
+Either way the promise is the one the Windows side makes: a name on screen is
+one a program here actually asked for, never a reverse lookup.
 
 Those two probes read `struct addrinfo`, and its offsets *are* hard-coded,
 which looks inconsistent next to the trouble taken over `struct sock`. The
@@ -472,7 +500,9 @@ cargo test
 | Limit | Consequence |
 |---|---|
 | Needs privilege | An ETW session needs Administrator; loading an eBPF program needs `CAP_BPF` and `CAP_PERFMON`. Neither question can be asked without them |
-| Only looked-up names are shown | A peer is named when a program here resolved it. On Linux that means through the C library; a statically linked Go binary carries its own resolver and is not seen |
+| Only looked-up names are shown | A peer is named when a program here resolved it — through the C library, or by reading the reply off the wire. An address nobody looked up stays an address |
+| No tray on Linux | Windows has an icon by the clock. The Linux equivalent is a StatusNotifierItem, which is not written |
+| x86-64 binaries only | It cross-compiles for ARM (above), but nothing published has been run on ARM hardware |
 | Only looked-up names are shown | A peer is named when this machine resolved it. Hard-coded addresses, and answers cached before netwatch started, stay addresses |
 | The record starts when you install it | netwatch cannot report on traffic from before it was recording — there is nothing kept anywhere else to read |
 | Times are UTC | The log and the reports use one clock, so a time printed matches a time in the file, wherever the file is read |
