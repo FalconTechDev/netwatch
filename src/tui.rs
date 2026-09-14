@@ -848,6 +848,28 @@ fn draw_detail(f: &mut Frame, app: &App, pid: u32) {
         }
     }
 
+    // What it has written. Only writes are recorded, so this is a short list
+    // and worth showing whole; reads would be thousands of library loads.
+    let wrote = app.state.writes(pid);
+    if !wrote.is_empty() {
+        const SHOWN: usize = 4;
+        // Newest first: what a program did a moment ago is the question, and
+        // the oldest entry is the one it has already moved on from.
+        for (n, path) in wrote.iter().rev().take(SHOWN).enumerate() {
+            fields.push(Line::from(vec![
+                Span::styled(format!("{:<11}", if n == 0 { "wrote" } else { "" }), dim),
+                Span::raw(trunc(path, 70)),
+            ]));
+        }
+        let more = wrote.len().saturating_sub(SHOWN);
+        if more > 0 {
+            fields.push(Line::from(Span::styled(
+                format!("{:<11}and {more} more", ""),
+                dim,
+            )));
+        }
+    }
+
     fields.push(Line::from(vec![
         Span::styled(format!("{:<11}", "seen"), dim),
         Span::raw(format!(

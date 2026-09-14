@@ -37,6 +37,15 @@ pub enum Event {
         addr: IpAddr,
         host: String,
     },
+    /// A file a program opened for writing.
+    ///
+    /// Writes only. What a program reads is mostly its own libraries and
+    /// configuration, thousands of times a second; what it writes is a short
+    /// list and is what someone actually wants to see.
+    Wrote {
+        pid: u32,
+        path: String,
+    },
     /// A program started, and what started it.
     ///
     /// This is the question "what set this off". A program that appears on

@@ -18,6 +18,7 @@
 pub const KIND_TRANSFER: u8 = 0;
 pub const KIND_NAME: u8 = 1;
 pub const KIND_START: u8 = 2;
+pub const KIND_FILE: u8 = 3;
 
 pub const PROTO_TCP: u8 = 0;
 pub const PROTO_UDP: u8 = 1;
@@ -106,6 +107,30 @@ pub struct RawStart {
     /// full path is looked up afterwards where the process lives long enough
     /// to be found.
     pub comm: [u8; COMM_MAX],
+}
+
+/// The most of a file path that is carried. A path longer than this is
+/// reported truncated rather than dropped: unlike a hostname, the leading part
+/// of a path is the informative half — which directory it is in.
+pub const PATH_MAX: usize = 128;
+
+/// A file a program opened for writing.
+///
+/// Only writes. Reads are almost entirely shared libraries, locale data and
+/// configuration, at thousands a second; recording them would bury the few
+/// events anyone wants in noise nobody would read.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RawFile {
+    /// Always `KIND_FILE`.
+    pub kind: u8,
+    /// How many bytes of `path` are used.
+    pub len: u8,
+    /// Whether the path was cut to fit.
+    pub truncated: u8,
+    pub _pad: [u8; 1],
+    pub pid: u32,
+    pub path: [u8; PATH_MAX],
 }
 
 /// An address this machine looked up, and the name it asked for.

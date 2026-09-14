@@ -23,8 +23,8 @@ use aya::programs::uprobe::UProbeScope;
 use aya::programs::{KProbe, UProbe};
 
 use netwatch_common::{
-    DIR_SENT, FAMILY_V6, KIND_NAME, KIND_START, KIND_TRANSFER, PROTO_UDP, RawName, RawStart,
-    RawTransfer, sock,
+    DIR_SENT, FAMILY_V6, KIND_FILE, KIND_NAME, KIND_START, KIND_TRANSFER, PROTO_UDP, RawFile,
+    RawName, RawStart, RawTransfer, sock,
 };
 
 use crate::event::{Dir, Event, Proto, Start, Transfer};
@@ -111,6 +111,7 @@ pub fn start(tx: Sender<Event>) -> Result<Session, String> {
 
     attach_name_lookups(&mut ebpf);
     attach_exec(&mut ebpf);
+    attach_writes(&mut ebpf);
 
     let ring = RingBuf::try_from(
         ebpf.take_map("EVENTS")
@@ -129,6 +130,27 @@ pub fn start(tx: Sender<Event>) -> Result<Session, String> {
         stop,
         reader: Some(reader),
     })
+}
+
+/// Watch files being opened for writing.
+///
+/// Failing is not fatal: everything else still works, and what a program wrote
+/// is simply not known. Said once rather than silently.
+fn attach_writes(ebpf: &mut aya::Ebpf) {
+    let program: Option<&mut aya::programs::TracePoint> = ebpf
+        .program_mut("sys_enter_openat")
+        .and_then(|p| p.try_into().ok());
+    let Some(program) = program else {
+        eprintln!("netwatch: what programs write will not be shown — no openat program");
+        return;
+    };
+    if let Err(e) = program.load() {
+        eprintln!("netwatch: what programs write will not be shown — {e}");
+        return;
+    }
+    if let Err(e) = program.attach("syscalls", "sys_enter_openat") {
+        eprintln!("netwatch: what programs write will not be shown — {e}");
+    }
 }
 
 /// Watch programs start, so that what set some traffic off can be shown
@@ -314,8 +336,38 @@ fn decode(raw: &[u8]) -> Option<Event> {
         KIND_TRANSFER => decode_transfer(raw),
         KIND_NAME => decode_name(raw),
         KIND_START => decode_start(raw),
+        KIND_FILE => decode_file(raw),
         _ => None,
     }
+}
+
+/// A file a program opened for writing.
+fn decode_file(raw: &[u8]) -> Option<Event> {
+    if raw.len() < size_of::<RawFile>() {
+        return None;
+    }
+    // SAFETY: length checked above; the kernel side writes exactly this
+    // `repr(C)` type. `read_unaligned` because the ring buffer only promises
+    // 8-byte alignment of the record start.
+    let f: RawFile = unsafe { std::ptr::read_unaligned(raw.as_ptr().cast()) };
+
+    let len = (f.len as usize).min(f.path.len());
+    if len == 0 {
+        return None;
+    }
+    // The helper writes a terminator inside the length it reports, so drop it
+    // rather than carrying a stray NUL into a string.
+    let bytes = &f.path[..len];
+    let bytes = bytes.strip_suffix(&[0]).unwrap_or(bytes);
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let mut path = String::from_utf8_lossy(bytes).into_owned();
+    if f.truncated != 0 {
+        path.push('…');
+    }
+    Some(Event::Wrote { pid: f.pid, path })
 }
 
 /// A program started. The kernel says which and what it is called; who started

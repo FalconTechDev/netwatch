@@ -104,6 +104,11 @@ pub struct State {
     /// where it is worth having — the thing that set the traffic off is rarely
     /// the thing doing it.
     starts: HashMap<u32, Origin>,
+    /// Files each process has opened for writing, in the order first seen.
+    /// Separate from `procs` for the same reason `starts` is: a program that
+    /// writes is not necessarily one that moves bytes, and the two questions
+    /// are asked independently.
+    writes: HashMap<u32, Vec<String>>,
     pub total: Traffic,
     /// Events that arrived, whether or not they were for a process we can name.
     pub events: u64,
@@ -135,6 +140,7 @@ impl State {
             names: Names::new(),
             hosts: HashMap::new(),
             starts: HashMap::new(),
+            writes: HashMap::new(),
             total: Traffic::default(),
             events: 0,
         }
@@ -145,7 +151,33 @@ impl State {
             Event::Transfer(t) => self.apply_transfer(t),
             Event::Named { addr, host } => self.apply_name(addr, host),
             Event::Started(s) => self.apply_start(s),
+            Event::Wrote { pid, path } => self.apply_write(pid, path),
         }
+    }
+
+    /// Remember that a program wrote to a file.
+    ///
+    /// Kept per process and capped. A program that writes to a log in a loop
+    /// would otherwise grow this without limit, and the hundredth write to the
+    /// same file says nothing the first did not.
+    fn apply_write(&mut self, pid: u32, path: String) {
+        /// Enough to show what a program has been doing without turning the
+        /// card into a file listing.
+        const KEEP: usize = 32;
+
+        let files = self.writes.entry(pid).or_default();
+        if files.contains(&path) {
+            return;
+        }
+        if files.len() >= KEEP {
+            files.remove(0);
+        }
+        files.push(path);
+    }
+
+    /// What a program has written to, oldest first.
+    pub fn writes(&self, pid: u32) -> &[String] {
+        self.writes.get(&pid).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// Remember that a program started, and what started it.
@@ -659,6 +691,54 @@ mod tests {
         let s = State::new();
         assert!(s.ancestry(1234).is_empty());
         assert!(s.origin(1234).is_none());
+    }
+
+    fn wrote(pid: u32, path: &str) -> Event {
+        Event::Wrote {
+            pid,
+            path: path.into(),
+        }
+    }
+
+    /// The same file written a hundred times says nothing the first one did
+    /// not, and a program that logs in a loop would otherwise fill this without
+    /// limit.
+    #[test]
+    fn a_file_written_repeatedly_is_listed_once() {
+        let mut s = State::new();
+        for _ in 0..50 {
+            s.apply(wrote(7, "/var/log/app.log"));
+        }
+        assert_eq!(s.writes(7), ["/var/log/app.log"]);
+    }
+
+    /// Capped, and it is the oldest that goes: what a program did a moment ago
+    /// is the question being asked.
+    #[test]
+    fn the_list_is_capped_and_keeps_the_newest() {
+        let mut s = State::new();
+        for i in 0..100 {
+            s.apply(wrote(7, &format!("/tmp/f{i}")));
+        }
+        let kept = s.writes(7);
+        assert!(kept.len() <= 32, "unbounded: {}", kept.len());
+        assert_eq!(kept.last().unwrap(), "/tmp/f99", "the newest was dropped");
+        assert!(
+            !kept.contains(&"/tmp/f0".to_string()),
+            "the oldest should have gone"
+        );
+    }
+
+    /// Files belong to the program that wrote them, not to whatever is being
+    /// looked at.
+    #[test]
+    fn writes_are_kept_per_program() {
+        let mut s = State::new();
+        s.apply(wrote(1, "/tmp/a"));
+        s.apply(wrote(2, "/tmp/b"));
+        assert_eq!(s.writes(1), ["/tmp/a"]);
+        assert_eq!(s.writes(2), ["/tmp/b"]);
+        assert!(s.writes(3).is_empty());
     }
 
     /// A name is only worth showing if it is the one the machine asked for.

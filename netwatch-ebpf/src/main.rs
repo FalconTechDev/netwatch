@@ -39,8 +39,9 @@ use aya_ebpf_bindings::bindings::bpf_pidns_info;
 use aya_ebpf_bindings::helpers::bpf_get_ns_current_pid_tgid;
 
 use netwatch_common::{
-    AF_INET, AF_INET6, COMM_MAX, DIR_RECEIVED, DIR_SENT, FAMILY_V4, FAMILY_V6, HOST_MAX, KIND_NAME,
-    KIND_START, KIND_TRANSFER, PROTO_TCP, PROTO_UDP, RawName, RawStart, RawTransfer, sock,
+    AF_INET, AF_INET6, COMM_MAX, DIR_RECEIVED, DIR_SENT, FAMILY_V4, FAMILY_V6, HOST_MAX, KIND_FILE,
+    KIND_NAME, KIND_START, KIND_TRANSFER, PATH_MAX, PROTO_TCP, PROTO_UDP, RawFile, RawName,
+    RawStart, RawTransfer, sock,
 };
 
 /// The pid namespace to report process ids in, as a device number and inode,
@@ -326,6 +327,119 @@ unsafe fn emit_name(family: u16, sa: u64, host: &[u8; HOST_MAX], len: usize) {
         host: *host,
     });
     entry.submit(0);
+}
+
+/// `sys_enter_openat`, where the arguments begin. The first eight bytes are
+/// the tracepoint's own header and the next eight the syscall number.
+mod openat {
+    /// `const char *filename`
+    pub const FILENAME: usize = 24;
+    /// `int flags`
+    pub const FLAGS: usize = 32;
+}
+
+/// The open flags that mean a program intends to change the file.
+mod oflag {
+    pub const WRONLY: u64 = 0o1;
+    pub const RDWR: u64 = 0o2;
+    pub const CREAT: u64 = 0o100;
+    pub const TRUNC: u64 = 0o1000;
+    pub const APPEND: u64 = 0o2000;
+}
+
+/// A file opened for writing.
+///
+/// Only writes, and the filtering happens here rather than in userspace
+/// because `openat` fires thousands of times a second on an idle machine.
+/// Sending all of it up and discarding it there would cost the ring buffer,
+/// the reader, and every event that got dropped to make room.
+///
+/// What a program reads is almost entirely its own libraries, locale data and
+/// configuration. What it writes is a short list, and is the thing anyone
+/// actually wants to see.
+#[tracepoint(category = "syscalls", name = "sys_enter_openat")]
+pub fn sys_enter_openat(ctx: TracePointContext) -> u32 {
+    // SAFETY: both reads are at fixed offsets inside the tracepoint's own
+    // record, whose layout the kernel publishes and which is checked against
+    // /sys/kernel/tracing at development time.
+    let (filename, flags) = unsafe {
+        let Ok(filename) = ctx.read_at::<u64>(openat::FILENAME) else {
+            return 0;
+        };
+        let Ok(flags) = ctx.read_at::<u64>(openat::FLAGS) else {
+            return 0;
+        };
+        (filename, flags)
+    };
+    if filename == 0 {
+        return 0;
+    }
+
+    let writing = flags & (oflag::WRONLY | oflag::RDWR) != 0
+        || flags & (oflag::CREAT | oflag::TRUNC | oflag::APPEND) != 0;
+    if !writing {
+        return 0;
+    }
+
+    let mut path = [0u8; PATH_MAX];
+    // SAFETY: the pointer is an argument of the calling program's own syscall
+    // and is read through the helper, which faults safely.
+    let Ok(read) = (unsafe { bpf_probe_read_user_str_bytes(filename as *const u8, &mut path) })
+    else {
+        return 0;
+    };
+    let len = read.len();
+    if len == 0 {
+        return 0;
+    }
+    if noise(&path, len) {
+        return 0;
+    }
+
+    let Some(mut entry) = EVENTS.reserve::<RawFile>(0) else {
+        return 0;
+    };
+    entry.write(RawFile {
+        kind: KIND_FILE,
+        len: len as u8,
+        // The helper fills the buffer and stops; a path that needed every byte
+        // was probably longer than that.
+        truncated: u8::from(len >= PATH_MAX - 1),
+        _pad: [0u8; 1],
+        pid: current_tgid(),
+        path,
+    });
+    entry.submit(0);
+    0
+}
+
+/// Whether a path is one of the places nothing interesting is ever written.
+///
+/// These are the kernel's own pseudo-filesystems and the terminal. Writes
+/// there are constant, and none of them is a program storing anything: they
+/// are how a process talks to the kernel and to its own screen.
+fn noise(path: &[u8; PATH_MAX], len: usize) -> bool {
+    const PREFIXES: [&[u8]; 5] = [b"/proc/", b"/sys/", b"/dev/pts/", b"/dev/tty", b"/dev/null"];
+
+    for prefix in PREFIXES {
+        if len >= prefix.len() {
+            // A bounded compare: the verifier needs the length known, and
+            // these are all short.
+            let mut same = true;
+            let mut i = 0;
+            while i < prefix.len() && i < PATH_MAX {
+                if path[i] != prefix[i] {
+                    same = false;
+                    break;
+                }
+                i += 1;
+            }
+            if same {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// A program started. Reported so that what set some traffic off can be seen

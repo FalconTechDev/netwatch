@@ -153,6 +153,11 @@ fn top(seconds: u64, by_total: bool) -> Result<(), String> {
                 println!("{:<26} as {}", "", o.user);
             }
         }
+        let wrote = st.writes(p.pid);
+        if !wrote.is_empty() {
+            let shown: Vec<String> = wrote.iter().rev().take(3).map(|p| trunc(p, 60)).collect();
+            println!("{:<26} wrote {}", "", shown.join(", "));
+        }
         let chain = st.ancestry(p.pid);
         if !chain.is_empty() {
             let path: Vec<String> = chain
