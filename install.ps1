@@ -16,6 +16,10 @@
 #   NETWATCH_NO_AUTOSTART=1   install the binary only, no task
 #   NETWATCH_DIR=<path>       install somewhere else
 #   NETWATCH_VERSION=v0.3.0   a particular release
+#   NETWATCH_ARCHIVE_FILE=..  install from an archive already on this machine
+#                             and download nothing. This is how the standalone
+#                             installer installs: it carries the archive inside
+#                             itself and points this at it.
 
 $ErrorActionPreference = 'Stop'
 
@@ -49,6 +53,10 @@ $target = 'x86_64-pc-windows-msvc'
 # ── which version ────────────────────────────────────────────────────────────
 
 $tag = $env:NETWATCH_VERSION
+# An archive already on disk needs no version looked up, and asking for one
+# would fail over the network for a reason that has nothing to do with the
+# install that is about to succeed.
+if (-not $tag -and $env:NETWATCH_ARCHIVE_FILE) { $tag = 'local' }
 if (-not $tag) {
     Write-Host 'Looking up the latest release...'
     $tag = (Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest").tag_name
@@ -63,20 +71,32 @@ $base    = "https://github.com/$Repo/releases/download/$tag"
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("netwatch-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $tmp | Out-Null
 try {
-    Write-Host "Downloading netwatch $tag..."
     $zip = Join-Path $tmp $archive
-    Invoke-WebRequest -Uri "$base/$archive" -OutFile $zip -UseBasicParsing
-
-    try {
-        $sumFile = Join-Path $tmp "$archive.sha256"
-        Invoke-WebRequest -Uri "$base/$archive.sha256" -OutFile $sumFile -UseBasicParsing
-        $expected = ((Get-Content $sumFile -Raw).Trim() -split '\s+')[0]
-        $actual   = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-        if ($expected -and $expected.ToLower() -ne $actual) {
-            throw 'Checksum mismatch - the download is not what the release published.'
+    if ($env:NETWATCH_ARCHIVE_FILE) {
+        if (-not (Test-Path $env:NETWATCH_ARCHIVE_FILE)) {
+            throw "Cannot read $($env:NETWATCH_ARCHIVE_FILE)."
         }
-    } catch [System.Net.WebException] {
-        Write-Host 'No checksum published for this release; skipping verification.'
+        Copy-Item $env:NETWATCH_ARCHIVE_FILE $zip -Force
+        Write-Host 'Installing from the archive supplied with this installer.'
+    }
+    else {
+        Write-Host "Downloading netwatch $tag..."
+        Invoke-WebRequest -Uri "$base/$archive" -OutFile $zip -UseBasicParsing
+
+        # A checksum proves a download arrived intact. An archive that came
+        # with the installer was never in transit, so there is nothing for one
+        # to prove - which is why this sits inside the download branch.
+        try {
+            $sumFile = Join-Path $tmp "$archive.sha256"
+            Invoke-WebRequest -Uri "$base/$archive.sha256" -OutFile $sumFile -UseBasicParsing
+            $expected = ((Get-Content $sumFile -Raw).Trim() -split '\s+')[0]
+            $actual   = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+            if ($expected -and $expected.ToLower() -ne $actual) {
+                throw 'Checksum mismatch - the download is not what the release published.'
+            }
+        } catch [System.Net.WebException] {
+            Write-Host 'No checksum published for this release; skipping verification.'
+        }
     }
 
     Expand-Archive -Path $zip -DestinationPath $tmp -Force

@@ -353,6 +353,28 @@ does not have.
 Needs a kernel with BTF (`CONFIG_DEBUG_INFO_BTF`), which every current
 distribution ships. The installer checks and warns before it installs anything.
 
+### Standalone, with nothing to download
+
+Each release also carries a **standalone installer**: one file with netwatch
+already inside it, which installs without reaching the network at all. Useful
+on a machine with no route to GitHub, behind a proxy that will not pass it, or
+anywhere the one-liner above is not wanted.
+
+```sh
+sh netwatch-standalone-installer.sh            # Linux
+```
+```powershell
+powershell -ExecutionPolicy Bypass -File netwatch-standalone-installer.ps1   # Windows, elevated
+```
+
+It is the same installer as above with the archive appended to it, not a second
+implementation — an offline path written separately is the one nobody would
+notice had stopped working. `tools/make-standalone.sh` and
+`tools/make-standalone.ps1` build them from a compiled binary.
+
+The Linux one must be run **as a file**, not piped into `sh`: it reads its own
+payload out of `$0`, and a pipe has no `$0` to read.
+
 ## How Linux is asked
 
 ETW has no equivalent here, so the question is put to the kernel directly, with

@@ -18,6 +18,14 @@
 #   NETWATCH_DIR=<path>       install somewhere else
 #   NETWATCH_VERSION=v0.9.0   a particular release
 #   NETWATCH_NO_CAPS=1        skip the capabilities; you will need sudo to run
+#   NETWATCH_BASE_URL=<url>   fetch the archive from somewhere else: a mirror,
+#                             a local file server, or a directory you unpacked
+#                             yourself. The archive and its .sha256 are
+#                             expected directly under it.
+#   NETWATCH_ARCHIVE_FILE=<p> install from an archive already on this machine
+#                             and download nothing. This is how the standalone
+#                             installer installs: it carries the archive inside
+#                             itself and points this at it.
 
 set -eu
 
@@ -48,6 +56,13 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 TAG="${NETWATCH_VERSION:-}"
+# An archive already on disk, or a mirror, needs no version looked up: whatever
+# is there is what gets installed. Asking GitHub for a tag would fail over the
+# network for a reason that has nothing to do with the install about to happen
+# — which is precisely the case the standalone installer is for.
+if [ -z "$TAG" ] && { [ -n "${NETWATCH_BASE_URL:-}" ] || [ -n "${NETWATCH_ARCHIVE_FILE:-}" ]; }; then
+    TAG=local
+fi
 if [ -z "$TAG" ]; then
     say 'Looking up the latest release...'
     TAG=$(
@@ -57,16 +72,31 @@ if [ -z "$TAG" ]; then
 fi
 [ -n "$TAG" ] || die 'could not work out the latest version; set NETWATCH_VERSION.'
 
-ARCHIVE="netwatch-$TAG-x86_64-unknown-linux-gnu.tar.gz"
-BASE="https://github.com/$REPO/releases/download/$TAG"
+if [ -n "${NETWATCH_BASE_URL:-}" ]; then
+    BASE="${NETWATCH_BASE_URL%/}"
+    ARCHIVE="${NETWATCH_ARCHIVE:-netwatch-x86_64-unknown-linux-gnu.tar.gz}"
+else
+    BASE="https://github.com/$REPO/releases/download/$TAG"
+    ARCHIVE="netwatch-$TAG-x86_64-unknown-linux-gnu.tar.gz"
+fi
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
-say "Downloading netwatch $TAG..."
-curl -fsSL "$BASE/$ARCHIVE" -o "$TMP/$ARCHIVE" || die "could not download $BASE/$ARCHIVE"
+if [ -n "${NETWATCH_ARCHIVE_FILE:-}" ]; then
+    [ -r "$NETWATCH_ARCHIVE_FILE" ] || die "cannot read $NETWATCH_ARCHIVE_FILE"
+    cp "$NETWATCH_ARCHIVE_FILE" "$TMP/$ARCHIVE"
+    say 'Installing from the archive supplied with this installer.'
+else
+    say "Downloading netwatch $TAG..."
+    curl -fsSL "$BASE/$ARCHIVE" -o "$TMP/$ARCHIVE" || die "could not download $BASE/$ARCHIVE"
+fi
 
-if curl -fsSL "$BASE/$ARCHIVE.sha256" -o "$TMP/sum" 2>/dev/null; then
+# A checksum proves a download arrived intact. An archive that came with the
+# installer was never in transit, so there is nothing for one to prove.
+if [ -n "${NETWATCH_ARCHIVE_FILE:-}" ]; then
+    :
+elif curl -fsSL "$BASE/$ARCHIVE.sha256" -o "$TMP/sum" 2>/dev/null; then
     if command -v sha256sum >/dev/null 2>&1; then
         want=$(cut -d' ' -f1 <"$TMP/sum")
         got=$(sha256sum "$TMP/$ARCHIVE" | cut -d' ' -f1)
