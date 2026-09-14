@@ -37,6 +37,26 @@ pub enum Event {
         addr: IpAddr,
         host: String,
     },
+    /// A program started, and what started it.
+    ///
+    /// This is the question "what set this off". A program that appears on
+    /// screen using the connection is only half an answer; the other half is
+    /// that it was started by a browser, or by a scheduled task, or by
+    /// something in a temp directory. Both halves have to be recorded as they
+    /// happen — a parent is often gone by the time anyone asks, and `/proc`
+    /// then says the process was started by init, which is true and useless.
+    Started(Start),
+}
+
+/// One program starting, as the kernel reported it.
+#[derive(Clone, Debug)]
+pub struct Start {
+    pub pid: u32,
+    pub parent: u32,
+    /// The name it runs under. From the kernel at the moment it started, not
+    /// looked up afterwards, because it may not last long enough to be found.
+    pub name: String,
+    pub parent_name: String,
 }
 
 /// One send or receive, as the kernel reported it.

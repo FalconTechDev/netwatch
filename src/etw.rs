@@ -12,7 +12,7 @@
 use std::net::IpAddr;
 use std::sync::mpsc::Sender;
 
-use crate::event::{Dir, Event, Proto, Transfer};
+use crate::event::{Dir, Event, Proto, Start, Transfer};
 
 use ferrisetw::EventRecord;
 use ferrisetw::parser::Parser;
@@ -22,6 +22,21 @@ use ferrisetw::trace::{UserTrace, stop_trace_by_name};
 
 /// {7DD42A49-5329-4832-8DFD-43D979153A88}
 const KERNEL_NETWORK: &str = "7dd42a49-5329-4832-8dfd-43d979153a88";
+
+/// Microsoft-Windows-Kernel-Process, which reports every process start with
+/// the process that started it. That pairing is the whole point: a program
+/// using the connection is half an answer, and what set it off is the other
+/// half.
+const KERNEL_PROCESS: &str = "22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716";
+
+/// `WINEVENT_KEYWORD_PROCESS`. Without it the provider reports threads, images
+/// and much else besides — a great deal of traffic through the session for
+/// events nothing here reads.
+const KEYWORD_PROCESS: u64 = 0x10;
+
+/// `ProcessStart`. The provider numbers stops and rundowns differently, and
+/// reading one of those as a start would report a program's exit as its birth.
+const OPCODE_PROCESS_START: u8 = 1;
 
 /// The name our trace session runs under.
 ///
@@ -49,6 +64,37 @@ fn classify(opcode: u8) -> Option<(Proto, Dir)> {
         59 => Some((Proto::Udp, Dir::Received)), // IPv6
         _ => None,
     }
+}
+
+/// A process starting, from the kernel's process provider.
+///
+/// The parent's name is not in the event and is left empty; whoever collects
+/// these fills it in from what it already knows about that pid.
+fn decode_start(record: &EventRecord, locator: &SchemaLocator) -> Option<Start> {
+    // The provider reports starts, stops and rundowns on the same keyword.
+    // Only a start says what started what.
+    if record.opcode() != OPCODE_PROCESS_START {
+        return None;
+    }
+    let schema = locator.event_schema(record).ok()?;
+    let parser = Parser::create(record, &schema);
+
+    let pid: u32 = parser.try_parse("ProcessID").ok()?;
+    let parent: u32 = parser.try_parse("ParentProcessID").unwrap_or(0);
+    let image: String = parser.try_parse("ImageName").ok()?;
+
+    Some(Start {
+        pid,
+        parent,
+        // The provider gives a device path; the file name is what anything
+        // else on the machine calls the program.
+        name: image
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(&image)
+            .to_string(),
+        parent_name: String::new(),
+    })
 }
 
 fn decode(record: &EventRecord, locator: &SchemaLocator) -> Option<Transfer> {
@@ -135,10 +181,22 @@ pub fn start(tx: Sender<Event>) -> Result<UserTrace, String> {
 
     // The second provider on the same session: one session, one ordered
     // stream, and one thing to clean up if this process is killed.
+    let names_tx = tx.clone();
     let names = Provider::by_guid(crate::dns::DNS_CLIENT)
         .add_callback(move |record: &EventRecord, locator: &SchemaLocator| {
             for ev in decode_dns(record, locator) {
-                let _ = tx.send(ev);
+                let _ = names_tx.send(ev);
+            }
+        })
+        .build();
+
+    // The third provider on the same session, for the same reason as the
+    // second: one session, one ordered stream, one thing to clean up.
+    let starts = Provider::by_guid(KERNEL_PROCESS)
+        .any(KEYWORD_PROCESS)
+        .add_callback(move |record: &EventRecord, locator: &SchemaLocator| {
+            if let Some(s) = decode_start(record, locator) {
+                let _ = tx.send(Event::Started(s));
             }
         })
         .build();
@@ -147,6 +205,7 @@ pub fn start(tx: Sender<Event>) -> Result<UserTrace, String> {
         .named(SESSION.to_string())
         .enable(traffic)
         .enable(names)
+        .enable(starts)
         .start_and_process()
         .map_err(|e| {
             format!(

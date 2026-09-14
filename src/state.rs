@@ -93,9 +93,23 @@ pub struct State {
     names: Names,
     /// Every address this machine has looked up, and the name it asked for.
     hosts: HashMap<IpAddr, String>,
+    /// Every program seen to start, whether or not it ever touched the
+    /// network. Kept apart from `procs` deliberately: a parent usually moves
+    /// no bytes of its own, and dropping it would break the chain exactly
+    /// where it is worth having — the thing that set the traffic off is rarely
+    /// the thing doing it.
+    starts: HashMap<u32, Origin>,
     pub total: Traffic,
     /// Events that arrived, whether or not they were for a process we can name.
     pub events: u64,
+}
+
+/// Where one program came from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Origin {
+    pub parent: u32,
+    pub name: String,
+    pub parent_name: String,
 }
 
 impl Default for State {
@@ -110,6 +124,7 @@ impl State {
             procs: HashMap::new(),
             names: Names::new(),
             hosts: HashMap::new(),
+            starts: HashMap::new(),
             total: Traffic::default(),
             events: 0,
         }
@@ -119,7 +134,84 @@ impl State {
         match ev {
             Event::Transfer(t) => self.apply_transfer(t),
             Event::Named { addr, host } => self.apply_name(addr, host),
+            Event::Started(s) => self.apply_start(s),
         }
+    }
+
+    /// Remember that a program started, and what started it.
+    fn apply_start(&mut self, mut s: crate::event::Start) {
+        // Not every source knows the parent's name — Windows reports the pid
+        // and nothing else — so it is filled in here, from a start already
+        // recorded or from the process table. Left empty it would show as a
+        // bare number, which names nothing to the person reading it.
+        if s.parent_name.is_empty() && s.parent != 0 {
+            s.parent_name = self
+                .starts
+                .get(&s.parent)
+                .map(|o| o.name.clone())
+                .unwrap_or_else(|| self.names.get(s.parent).name.clone());
+        }
+
+        // A process id is reused once the number wraps, so a new start
+        // replaces whatever was recorded under it. Keeping the older entry
+        // would attach this program's traffic to a program that has been gone
+        // for hours.
+        self.starts.insert(
+            s.pid,
+            Origin {
+                parent: s.parent,
+                name: s.name,
+                parent_name: s.parent_name,
+            },
+        );
+    }
+
+    /// The chain that led to a program: its parent first, then its parent's
+    /// parent, for as far back as netwatch was watching.
+    ///
+    /// Bounded, and it refuses to revisit a process it has already passed.
+    /// Process ids are reused, and a reused one can point at a descendant —
+    /// which is a loop, and a loop here would hang the screen.
+    pub fn ancestry(&self, pid: u32) -> Vec<(u32, String)> {
+        const DEPTH: usize = 16;
+
+        let mut chain = Vec::new();
+        let mut seen = vec![pid];
+        let mut at = pid;
+
+        for _ in 0..DEPTH {
+            let Some(origin) = self.starts.get(&at) else {
+                break;
+            };
+            // Pid 0 is the kernel, and a process is not its own parent.
+            if origin.parent == 0 || seen.contains(&origin.parent) {
+                break;
+            }
+            chain.push((origin.parent, origin.parent_name.clone()));
+            seen.push(origin.parent);
+            at = origin.parent;
+        }
+        chain
+    }
+
+    /// What a program started, of what netwatch saw start.
+    ///
+    /// Sorted by pid, which is the order they were created in, so a list of
+    /// children reads as a sequence of events rather than as a set.
+    pub fn children(&self, pid: u32) -> Vec<(u32, String)> {
+        let mut kids: Vec<(u32, String)> = self
+            .starts
+            .iter()
+            .filter(|(child, origin)| origin.parent == pid && **child != pid)
+            .map(|(child, origin)| (*child, origin.name.clone()))
+            .collect();
+        kids.sort_unstable_by_key(|(pid, _)| *pid);
+        kids
+    }
+
+    /// What netwatch saw a program start as, when it saw it start at all.
+    pub fn origin(&self, pid: u32) -> Option<&Origin> {
+        self.starts.get(&pid)
     }
 
     /// Remember a lookup, and name anything already talking to that address.
@@ -459,6 +551,87 @@ mod tests {
         }));
         let ranked = s.ranked(false);
         assert_eq!(ranked.first().expect("listed").peers.len(), 1);
+    }
+
+    fn started(pid: u32, parent: u32, name: &str, parent_name: &str) -> Event {
+        Event::Started(crate::event::Start {
+            pid,
+            parent,
+            name: name.into(),
+            parent_name: parent_name.into(),
+        })
+    }
+
+    /// The chain is the answer to "what set this off", and it has to survive
+    /// the middle of it having no traffic of its own — which is the usual
+    /// case, since a launcher rarely downloads anything itself.
+    #[test]
+    fn the_chain_that_led_to_a_program_is_kept() {
+        let mut s = State::new();
+        s.apply(started(100, 1, "explorer.exe", "init"));
+        s.apply(started(200, 100, "chrome.exe", "explorer.exe"));
+        s.apply(started(300, 200, "chrome.exe", "chrome.exe"));
+
+        let chain = s.ancestry(300);
+        assert_eq!(
+            chain,
+            vec![
+                (200, "chrome.exe".to_string()),
+                (100, "explorer.exe".to_string()),
+                (1, "init".to_string()),
+            ]
+        );
+    }
+
+    /// Process ids are reused. A reused one can name a descendant as its
+    /// parent, which is a loop — and a loop walked to the end would hang the
+    /// screen rather than draw it.
+    #[test]
+    fn a_loop_in_the_chain_does_not_hang() {
+        let mut s = State::new();
+        s.apply(started(10, 20, "a", "b"));
+        s.apply(started(20, 10, "b", "a"));
+
+        let chain = s.ancestry(10);
+        assert!(chain.len() <= 2, "walked into a loop: {chain:?}");
+    }
+
+    /// "What did it start" is the other half of the question, and it has to
+    /// read in the order things happened.
+    #[test]
+    fn what_a_program_started_is_listed_in_order() {
+        let mut s = State::new();
+        s.apply(started(500, 100, "curl", "sh"));
+        s.apply(started(400, 100, "wget", "sh"));
+        s.apply(started(600, 999, "unrelated", "other"));
+
+        assert_eq!(
+            s.children(100),
+            vec![(400, "wget".to_string()), (500, "curl".to_string())]
+        );
+        assert!(s.children(42).is_empty());
+    }
+
+    /// When a pid is reused, the newer program owns it. Keeping the older
+    /// entry would hang this program's traffic on something long gone.
+    #[test]
+    fn a_reused_pid_belongs_to_the_newer_program() {
+        let mut s = State::new();
+        s.apply(started(77, 1, "old.exe", "init"));
+        s.apply(started(77, 2, "new.exe", "sh"));
+
+        let o = s.origin(77).expect("recorded");
+        assert_eq!(o.name, "new.exe");
+        assert_eq!(o.parent, 2);
+    }
+
+    /// Nothing is invented for a program that was already running when
+    /// netwatch started: it has no recorded parent, and saying so is right.
+    #[test]
+    fn a_program_that_was_already_running_has_no_chain() {
+        let s = State::new();
+        assert!(s.ancestry(1234).is_empty());
+        assert!(s.origin(1234).is_none());
     }
 
     /// A name is only worth showing if it is the one the machine asked for.

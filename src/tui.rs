@@ -744,9 +744,26 @@ fn draw_confirm(f: &mut Frame, c: &Confirm) {
 fn draw_detail(f: &mut Frame, app: &App, pid: u32) {
     let Some(p) = app.state.get(pid) else { return };
 
+    // One row per field, plus the blank line before the peers. Sized from the
+    // field list rather than guessed: adding a field and forgetting this is
+    // how the last one silently disappeared.
+    const FIELDS: u16 = 8;
+
     let area = f.area();
     let w = area.width.saturating_sub(6).clamp(40, 100);
-    let h = area.height.saturating_sub(4).clamp(12, 26);
+    // The card has to fit its fields, the blank line after them, its borders,
+    // and enough of the peer table to be worth opening at all. Deriving the
+    // height from the field count is what stops a new field from quietly
+    // pushing the peers off the bottom — which is exactly what adding the two
+    // lineage lines did when this was a constant.
+    const MIN_H: u16 = FIELDS + 1 + 2 + 3;
+    let h = area
+        .height
+        .saturating_sub(4)
+        .clamp(MIN_H, 26)
+        // On a screen too short for even that, the card takes what there is
+        // rather than drawing past the bottom.
+        .min(area.height);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
@@ -773,10 +790,6 @@ fn draw_detail(f: &mut Frame, app: &App, pid: u32) {
         vertical: 1,
         horizontal: 1,
     });
-    // One row per field, plus the blank line before the peers. Sized from the
-    // field list rather than guessed: adding a field and forgetting this is
-    // how the last one silently disappeared.
-    const FIELDS: u16 = 6;
     let parts = Layout::vertical([Constraint::Length(FIELDS + 1), Constraint::Min(1)]).split(inner);
 
     let dim = Style::new().fg(Color::DarkGray);
@@ -788,7 +801,7 @@ fn draw_detail(f: &mut Frame, app: &App, pid: u32) {
             (value.to_string(), Style::new())
         };
         Line::from(vec![
-            Span::styled(format!("{label:<10}"), dim),
+            Span::styled(format!("{label:<11}"), dim),
             Span::styled(text, style),
         ])
     };
@@ -800,7 +813,7 @@ fn draw_detail(f: &mut Frame, app: &App, pid: u32) {
             // program, and it should not have to be found in the middle of a
             // line of byte counts.
             Line::from(vec![
-                Span::styled(format!("{:<10}", "pid"), dim),
+                Span::styled(format!("{:<11}", "pid"), dim),
                 Span::styled(p.pid.to_string(), Style::new().bold()),
                 Span::styled(format!("   {} peers, {}", peers.len(), protocols(p)), dim),
             ]),
@@ -815,8 +828,37 @@ fn draw_detail(f: &mut Frame, app: &App, pid: u32) {
                 "no publisher named in the file",
             ),
             field("path", &p.info.path, "could not be read"),
+            // What set this off, and what it set off in turn. Both are shown
+            // as "not seen" rather than left out when netwatch was not running
+            // at the time: an absent line reads as "nothing", and nothing is a
+            // different claim from "this was already running".
             Line::from(vec![
-                Span::styled(format!("{:<10}", "seen"), dim),
+                Span::styled(format!("{:<11}", "started by"), dim),
+                match app.state.ancestry(pid).first() {
+                    Some((ppid, name)) => Span::raw(format!("{name} ({ppid})")),
+                    None => Span::styled("not seen starting", unknown),
+                },
+            ]),
+            Line::from(vec![Span::styled(format!("{:<11}", "it started"), dim), {
+                let kids = app.state.children(pid);
+                if kids.is_empty() {
+                    Span::styled("nothing, while watched", dim)
+                } else {
+                    let names: Vec<String> = kids
+                        .iter()
+                        .take(4)
+                        .map(|(pid, name)| format!("{name} ({pid})"))
+                        .collect();
+                    let more = kids.len().saturating_sub(names.len());
+                    Span::raw(if more == 0 {
+                        names.join(", ")
+                    } else {
+                        format!("{}, and {more} more", names.join(", "))
+                    })
+                }
+            }]),
+            Line::from(vec![
+                Span::styled(format!("{:<11}", "seen"), dim),
                 Span::raw(format!(
                     "{} ago, first {} into this run",
                     ago(p.last_seen.elapsed()),
@@ -824,7 +866,7 @@ fn draw_detail(f: &mut Frame, app: &App, pid: u32) {
                 )),
             ]),
             Line::from(vec![
-                Span::styled(format!("{:<10}", "traffic"), dim),
+                Span::styled(format!("{:<11}", "traffic"), dim),
                 Span::styled(bytes(p.traffic.received), Style::new().fg(Color::Green)),
                 Span::styled(" down · ", dim),
                 Span::styled(bytes(p.traffic.sent), Style::new().fg(Color::Blue)),
@@ -996,6 +1038,70 @@ mod tests {
             recording: true,
             started: Instant::now(),
         }
+    }
+
+    /// Adding a field to the card once pushed the traffic line off the bottom,
+    /// because the height was a constant somebody forgot to change. These two
+    /// are new, so the whole card is pinned rather than just them.
+    #[test]
+    fn the_detail_card_still_shows_every_field() {
+        let mut app = demo();
+        app.expanded = Some(6124);
+        let screen = render(&mut app, 110, 30);
+
+        for expected in [
+            "pid",
+            "described",
+            "publisher",
+            "path",
+            "started by",
+            "it started",
+            "seen",
+            "traffic",
+        ] {
+            assert!(
+                screen.contains(expected),
+                "the card lost its {expected} line:
+{screen}"
+            );
+        }
+    }
+
+    /// A program netwatch did not see start has no chain, and the card must
+    /// say so rather than leave a blank that reads as "started by nothing".
+    #[test]
+    fn a_program_with_no_recorded_start_says_so() {
+        let mut app = demo();
+        app.expanded = Some(6124);
+        let screen = render(&mut app, 110, 30);
+        assert!(screen.contains("not seen starting"), "{screen}");
+        assert!(screen.contains("nothing, while watched"), "{screen}");
+    }
+
+    /// When the chain is known it is named, with the pid, so it can be looked
+    /// up in anything else on the machine.
+    #[test]
+    fn a_recorded_chain_is_shown_in_the_card() {
+        let mut app = demo();
+        app.state
+            .apply(crate::event::Event::Started(crate::event::Start {
+                pid: 6124,
+                parent: 4100,
+                name: "firefox.exe".into(),
+                parent_name: "explorer.exe".into(),
+            }));
+        app.state
+            .apply(crate::event::Event::Started(crate::event::Start {
+                pid: 9001,
+                parent: 6124,
+                name: "crashreporter.exe".into(),
+                parent_name: "firefox.exe".into(),
+            }));
+        app.expanded = Some(6124);
+        let screen = render(&mut app, 110, 30);
+
+        assert!(screen.contains("explorer.exe (4100)"), "{screen}");
+        assert!(screen.contains("crashreporter.exe (9001)"), "{screen}");
     }
 
     /// The warning must survive a narrow terminal, and must name a command

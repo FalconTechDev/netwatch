@@ -17,6 +17,7 @@
 /// their order, and two buffers would race.
 pub const KIND_TRANSFER: u8 = 0;
 pub const KIND_NAME: u8 = 1;
+pub const KIND_START: u8 = 2;
 
 pub const PROTO_TCP: u8 = 0;
 pub const PROTO_UDP: u8 = 1;
@@ -80,6 +81,31 @@ pub struct RawTransfer {
     /// the value came from, rather than left for the reader to remember.
     pub port: u16,
     pub _pad: [u8; 6],
+}
+
+/// The kernel's own limit on a process name, and the size of the field it
+/// keeps one in.
+pub const COMM_MAX: usize = 16;
+
+/// A program starting.
+///
+/// Only the process and the name it is running under: who started it is asked
+/// of `/proc` by the reader, because the kernel counts parents in the
+/// namespace it booted in, and inside a container that number names a
+/// different process entirely.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RawStart {
+    /// Always `KIND_START`.
+    pub kind: u8,
+    /// How many bytes of `comm` are used.
+    pub len: u8,
+    pub _pad: [u8; 2],
+    pub pid: u32,
+    /// The kernel truncates this to fifteen characters and a terminator; the
+    /// full path is looked up afterwards where the process lives long enough
+    /// to be found.
+    pub comm: [u8; COMM_MAX],
 }
 
 /// An address this machine looked up, and the name it asked for.

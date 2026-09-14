@@ -23,10 +23,11 @@ use aya::programs::uprobe::UProbeScope;
 use aya::programs::{KProbe, UProbe};
 
 use netwatch_common::{
-    DIR_SENT, FAMILY_V6, KIND_NAME, KIND_TRANSFER, PROTO_UDP, RawName, RawTransfer, sock,
+    DIR_SENT, FAMILY_V6, KIND_NAME, KIND_START, KIND_TRANSFER, PROTO_UDP, RawName, RawStart,
+    RawTransfer, sock,
 };
 
-use crate::event::{Dir, Event, Proto, Transfer};
+use crate::event::{Dir, Event, Proto, Start, Transfer};
 
 /// The programs in the object, and the kernel function each attaches to.
 /// Listed here rather than at the point of use so the set reads as one
@@ -109,6 +110,7 @@ pub fn start(tx: Sender<Event>) -> Result<Session, String> {
     }
 
     attach_name_lookups(&mut ebpf);
+    attach_exec(&mut ebpf);
 
     let ring = RingBuf::try_from(
         ebpf.take_map("EVENTS")
@@ -127,6 +129,29 @@ pub fn start(tx: Sender<Event>) -> Result<Session, String> {
         stop,
         reader: Some(reader),
     })
+}
+
+/// Watch programs start, so that what set some traffic off can be shown
+/// beside the traffic itself.
+///
+/// Failing is not fatal: the traffic is still measured, and the chain is
+/// simply not known. Said once rather than silently, because an empty chain
+/// otherwise reads as "nothing started anything".
+fn attach_exec(ebpf: &mut aya::Ebpf) {
+    let program: Option<&mut aya::programs::TracePoint> = ebpf
+        .program_mut("sched_process_exec")
+        .and_then(|p| p.try_into().ok());
+    let Some(program) = program else {
+        eprintln!("netwatch: what started what will not be shown — no exec program");
+        return;
+    };
+    if let Err(e) = program.load() {
+        eprintln!("netwatch: what started what will not be shown — {e}");
+        return;
+    }
+    if let Err(e) = program.attach("sched", "sched_process_exec") {
+        eprintln!("netwatch: what started what will not be shown — {e}");
+    }
 }
 
 /// Watch the C library resolve names, so a peer can be shown as the name the
@@ -288,8 +313,76 @@ fn decode(raw: &[u8]) -> Option<Event> {
     match raw.first().copied()? {
         KIND_TRANSFER => decode_transfer(raw),
         KIND_NAME => decode_name(raw),
+        KIND_START => decode_start(raw),
         _ => None,
     }
+}
+
+/// A program started. The kernel says which and what it is called; who started
+/// it is asked of `/proc`, which counts parents in this namespace where the
+/// kernel counts them in its own.
+///
+/// The parent is read now, while the event is fresh, because a process that
+/// lives a fraction of a second is exactly the one worth knowing the parent
+/// of — and a moment later there is nothing left to ask.
+fn decode_start(raw: &[u8]) -> Option<Event> {
+    if raw.len() < size_of::<RawStart>() {
+        return None;
+    }
+    // SAFETY: length checked above; the kernel side writes exactly this
+    // `repr(C)` type. `read_unaligned` because the ring buffer only promises
+    // 8-byte alignment of the record start.
+    let s: RawStart = unsafe { std::ptr::read_unaligned(raw.as_ptr().cast()) };
+
+    let len = s.len as usize;
+    if len == 0 || len > s.comm.len() {
+        return None;
+    }
+    let comm = String::from_utf8_lossy(&s.comm[..len]).into_owned();
+
+    let (parent, parent_name) = parent_of(s.pid);
+    Some(Event::Started(Start {
+        // The path is preferred where it can still be read: the kernel cuts a
+        // name at fifteen characters, so `comm` alone turns two different
+        // programs into the same one.
+        name: exe_name(s.pid).unwrap_or(comm),
+        pid: s.pid,
+        parent,
+        parent_name,
+    }))
+}
+
+/// The file name of a running process, or nothing if it has already gone.
+fn exe_name(pid: u32) -> Option<String> {
+    let path = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    Some(path.file_name()?.to_string_lossy().into_owned())
+}
+
+/// Who started a process, from `/proc/<pid>/status`.
+///
+/// Zero and an empty name when it cannot be read, which says "not known"
+/// rather than naming the wrong thing.
+fn parent_of(pid: u32) -> (u32, String) {
+    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return (0, String::new());
+    };
+    let ppid = status
+        .lines()
+        .find_map(|l| l.strip_prefix("PPid:"))
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    if ppid == 0 {
+        return (0, String::new());
+    }
+
+    let name = exe_name(ppid)
+        .or_else(|| {
+            std::fs::read_to_string(format!("/proc/{ppid}/comm"))
+                .ok()
+                .map(|s| s.trim().to_owned())
+        })
+        .unwrap_or_default();
+    (ppid, name)
 }
 
 fn decode_name(raw: &[u8]) -> Option<Event> {

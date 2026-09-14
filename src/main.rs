@@ -137,6 +137,18 @@ fn top(seconds: u64, by_total: bool) -> Result<(), String> {
             bytes(p.traffic.total()),
             p.peers.len()
         );
+        // What set it off, where that was seen. Indented under the program
+        // rather than given a column, because the chain has no fixed width and
+        // most rows have none at all.
+        let chain = st.ancestry(p.pid);
+        if !chain.is_empty() {
+            let path: Vec<String> = chain
+                .iter()
+                .rev()
+                .map(|(pid, name)| format!("{name} ({pid})"))
+                .collect();
+            println!("{:<26} started by {}", "", path.join(" → "));
+        }
     }
 
     println!(

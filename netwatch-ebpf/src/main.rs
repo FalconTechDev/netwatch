@@ -28,18 +28,19 @@
 #![no_main]
 
 use aya_ebpf::helpers::{
-    bpf_get_current_pid_tgid, bpf_probe_read_kernel, bpf_probe_read_kernel_buf,
-    bpf_probe_read_user, bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes,
+    bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_kernel,
+    bpf_probe_read_kernel_buf, bpf_probe_read_user, bpf_probe_read_user_buf,
+    bpf_probe_read_user_str_bytes,
 };
-use aya_ebpf::macros::{kprobe, map, uprobe, uretprobe};
+use aya_ebpf::macros::{kprobe, map, tracepoint, uprobe, uretprobe};
 use aya_ebpf::maps::{Array, HashMap, RingBuf};
-use aya_ebpf::programs::{ProbeContext, RetProbeContext};
+use aya_ebpf::programs::{ProbeContext, RetProbeContext, TracePointContext};
 use aya_ebpf_bindings::bindings::bpf_pidns_info;
 use aya_ebpf_bindings::helpers::bpf_get_ns_current_pid_tgid;
 
 use netwatch_common::{
-    AF_INET, AF_INET6, DIR_RECEIVED, DIR_SENT, FAMILY_V4, FAMILY_V6, HOST_MAX, KIND_NAME,
-    KIND_TRANSFER, PROTO_TCP, PROTO_UDP, RawName, RawTransfer, sock,
+    AF_INET, AF_INET6, COMM_MAX, DIR_RECEIVED, DIR_SENT, FAMILY_V4, FAMILY_V6, HOST_MAX, KIND_NAME,
+    KIND_START, KIND_TRANSFER, PROTO_TCP, PROTO_UDP, RawName, RawStart, RawTransfer, sock,
 };
 
 /// The pid namespace to report process ids in, as a device number and inode,
@@ -325,6 +326,41 @@ unsafe fn emit_name(family: u16, sa: u64, host: &[u8; HOST_MAX], len: usize) {
         host: *host,
     });
     entry.submit(0);
+}
+
+/// A program started. Reported so that what set some traffic off can be seen
+/// alongside the traffic itself.
+///
+/// A tracepoint rather than a kprobe: this is part of the kernel's published
+/// tracing interface and does not move between versions, where the function
+/// behind it has been renamed more than once.
+///
+/// Only the process and its name are sent. Who started it is left to the
+/// reader to ask `/proc`, because the parent's id in `task_struct` is counted
+/// in the namespace the kernel booted in — inside a container that number
+/// names a different process, and a wrong parent is worse than none.
+#[tracepoint(category = "sched", name = "sched_process_exec")]
+pub fn sched_process_exec(_ctx: TracePointContext) -> u32 {
+    let Ok(comm) = bpf_get_current_comm() else {
+        return 0;
+    };
+    let len = comm.iter().position(|b| *b == 0).unwrap_or(COMM_MAX);
+    if len == 0 {
+        return 0;
+    }
+
+    let Some(mut entry) = EVENTS.reserve::<RawStart>(0) else {
+        return 0;
+    };
+    entry.write(RawStart {
+        kind: KIND_START,
+        len: len as u8,
+        _pad: [0u8; 2],
+        pid: current_tgid(),
+        comm,
+    });
+    entry.submit(0);
+    0
 }
 
 /// The far end of a socket: its address and port, read out of `struct sock`
