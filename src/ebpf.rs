@@ -19,9 +19,12 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use aya::maps::RingBuf;
-use aya::programs::KProbe;
+use aya::programs::uprobe::UProbeScope;
+use aya::programs::{KProbe, UProbe};
 
-use netwatch_common::{DIR_SENT, FAMILY_V6, PROTO_UDP, RawTransfer, sock};
+use netwatch_common::{
+    DIR_SENT, FAMILY_V6, KIND_NAME, KIND_TRANSFER, PROTO_UDP, RawName, RawTransfer, sock,
+};
 
 use crate::event::{Dir, Event, Proto, Transfer};
 
@@ -105,6 +108,8 @@ pub fn start(tx: Sender<Event>) -> Result<Session, String> {
         })?;
     }
 
+    attach_name_lookups(&mut ebpf);
+
     let ring = RingBuf::try_from(
         ebpf.take_map("EVENTS")
             .ok_or_else(|| "the eBPF object has no EVENTS map".to_string())?,
@@ -122,6 +127,44 @@ pub fn start(tx: Sender<Event>) -> Result<Session, String> {
         stop,
         reader: Some(reader),
     })
+}
+
+/// Watch the C library resolve names, so a peer can be shown as the name the
+/// machine asked for rather than as the address it got back.
+///
+/// This is the counterpart to the DNS provider netwatch reads on Windows, and
+/// it makes the same promise: a name on screen is one a program here actually
+/// looked up. It is not a reverse lookup, which would invent a name the
+/// traffic never mentioned.
+///
+/// Failing is not fatal — peers simply stay addresses, which is what they were
+/// a moment ago. It is reported once rather than silently, because "no names
+/// appeared" is otherwise indistinguishable from "nothing was looked up".
+///
+/// What it cannot see: a program that does not use the C library's resolver —
+/// a statically linked Go binary, most obviously, which carries its own.
+fn attach_name_lookups(ebpf: &mut aya::Ebpf) {
+    const LIBC: &str = "libc";
+
+    for (program, entry) in [("getaddrinfo", true), ("getaddrinfo_ret", false)] {
+        let probe: Option<&mut UProbe> = ebpf.program_mut(program).and_then(|p| p.try_into().ok());
+        let Some(probe) = probe else {
+            eprintln!("netwatch: peers will stay addresses — no {program} program");
+            return;
+        };
+        if let Err(e) = probe.load() {
+            eprintln!("netwatch: peers will stay addresses — could not load {program}: {e}");
+            return;
+        }
+        // Attached by symbol in the C library rather than by a path, so it
+        // follows wherever this distribution keeps it, and for every process
+        // rather than one.
+        if let Err(e) = probe.attach("getaddrinfo", LIBC, UProbeScope::AllProcesses) {
+            let _ = entry;
+            eprintln!("netwatch: peers will stay addresses — could not watch getaddrinfo: {e}");
+            return;
+        }
+    }
 }
 
 /// Tell the eBPF program where this kernel keeps the `struct sock` fields it
@@ -236,15 +279,48 @@ fn read_loop(mut ring: RingBuf<aya::maps::MapData>, tx: Sender<Event>, stop: Arc
     }
 }
 
-/// Turn the bytes the kernel wrote into an event, or nothing if they are not
-/// the size they should be.
+/// Turn the bytes the kernel wrote into an event.
+///
+/// Two kinds of record share the buffer, and the first byte says which. A
+/// record of the wrong length for what it claims to be is dropped rather than
+/// read: the alternative is reading whatever follows it as an address.
 fn decode(raw: &[u8]) -> Option<Event> {
+    match raw.first().copied()? {
+        KIND_TRANSFER => decode_transfer(raw),
+        KIND_NAME => decode_name(raw),
+        _ => None,
+    }
+}
+
+fn decode_name(raw: &[u8]) -> Option<Event> {
+    if raw.len() < size_of::<RawName>() {
+        return None;
+    }
+    // SAFETY: length checked above; the kernel side writes exactly this
+    // `repr(C)` type. `read_unaligned` because the ring buffer only promises
+    // 8-byte alignment of the record start.
+    let n: RawName = unsafe { std::ptr::read_unaligned(raw.as_ptr().cast()) };
+
+    let len = n.len as usize;
+    if len == 0 || len > n.host.len() {
+        return None;
+    }
+    let host = std::str::from_utf8(&n.host[..len]).ok()?.to_owned();
+    if !crate::dns::is_plausible_name(&host) {
+        return None;
+    }
+
+    Some(Event::Named {
+        addr: address(n.family, &n.addr),
+        host,
+    })
+}
+
+fn decode_transfer(raw: &[u8]) -> Option<Event> {
     if raw.len() < size_of::<RawTransfer>() {
         return None;
     }
-    // SAFETY: the length is checked above, and the kernel side writes exactly
-    // this `repr(C)` type into the ring buffer. `read_unaligned` because the
-    // ring buffer only guarantees 8-byte alignment of the record start.
+    // SAFETY: as above.
     let t: RawTransfer = unsafe { std::ptr::read_unaligned(raw.as_ptr().cast()) };
 
     Some(Event::Transfer(Transfer {
@@ -260,16 +336,16 @@ fn decode(raw: &[u8]) -> Option<Event> {
             Dir::Received
         },
         bytes: t.bytes,
-        peer: peer_addr(&t),
+        peer: address(t.family, &t.addr),
         peer_port: t.port,
     }))
 }
 
-fn peer_addr(t: &RawTransfer) -> IpAddr {
-    if t.family == FAMILY_V6 {
-        IpAddr::V6(Ipv6Addr::from(t.addr))
+fn address(family: u8, raw: &[u8; 16]) -> IpAddr {
+    if family == FAMILY_V6 {
+        IpAddr::V6(Ipv6Addr::from(*raw))
     } else {
-        IpAddr::V4(Ipv4Addr::new(t.addr[0], t.addr[1], t.addr[2], t.addr[3]))
+        IpAddr::V4(Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3]))
     }
 }
 
@@ -294,27 +370,46 @@ mod tests {
     use super::*;
     use netwatch_common::{DIR_RECEIVED, FAMILY_V4, PROTO_TCP};
 
+    /// The bytes of any plain-data record, exactly as the kernel would have
+    /// written them — which is the property both sides rely on.
+    ///
+    /// # Safety
+    /// `T` must be `repr(C)` and contain no padding the reader would misread,
+    /// which is true of both record types by construction.
+    unsafe fn bytes_of<T>(v: &T) -> Vec<u8> {
+        // SAFETY: the caller's contract.
+        unsafe { std::slice::from_raw_parts((v as *const T).cast::<u8>(), size_of::<T>()) }.to_vec()
+    }
+
     fn raw(dir: u8, proto: u8, bytes: u64, family: u8, addr: [u8; 16], port: u16) -> Vec<u8> {
         let t = RawTransfer {
-            bytes,
-            pid: 1234,
-            addr,
-            port,
+            kind: KIND_TRANSFER,
             proto,
             dir,
             family,
-            _pad: [0; 7],
+            pid: 1234,
+            bytes,
+            addr,
+            port,
+            _pad: [0; 6],
         };
-        // SAFETY: RawTransfer is repr(C) and plain data, so its bytes are a
-        // faithful representation of it — which is the property the kernel
-        // side relies on too.
-        unsafe {
-            std::slice::from_raw_parts(
-                (&t as *const RawTransfer).cast::<u8>(),
-                size_of::<RawTransfer>(),
-            )
-        }
-        .to_vec()
+        // SAFETY: RawTransfer is repr(C) plain data.
+        unsafe { bytes_of(&t) }
+    }
+
+    fn raw_name(host: &str, family: u8, addr: [u8; 16]) -> Vec<u8> {
+        let mut buf = [0u8; netwatch_common::HOST_MAX];
+        buf[..host.len()].copy_from_slice(host.as_bytes());
+        let n = RawName {
+            kind: KIND_NAME,
+            family,
+            len: host.len() as u8,
+            _pad: [0; 5],
+            addr,
+            host: buf,
+        };
+        // SAFETY: RawName is repr(C) plain data.
+        unsafe { bytes_of(&n) }
     }
 
     /// The decoder and the kernel struct have to agree byte for byte. If they
@@ -354,5 +449,52 @@ mod tests {
     #[test]
     fn a_truncated_record_is_refused() {
         assert!(decode(&[0u8; 4]).is_none());
+    }
+
+    /// Two kinds of record share one buffer, so the first byte has to decide
+    /// which is which. Reading a name as a transfer would turn a hostname into
+    /// a byte count.
+    #[test]
+    fn a_name_record_is_read_as_a_name() {
+        let mut a = [0u8; 16];
+        a[..4].copy_from_slice(&[104, 20, 23, 154]);
+        let bytes = raw_name("example.com", netwatch_common::FAMILY_V4, a);
+
+        let Some(Event::Named { addr, host }) = decode(&bytes) else {
+            panic!("did not decode to a name");
+        };
+        assert_eq!(host, "example.com");
+        assert_eq!(addr, IpAddr::V4(Ipv4Addr::new(104, 20, 23, 154)));
+    }
+
+    /// A name that is not a name must not become one. The kernel copies bytes
+    /// out of another program's memory, and nothing there is guaranteed.
+    #[test]
+    fn rubbish_in_the_name_field_is_refused() {
+        let a = [0u8; 16];
+        // A length that claims more than the buffer holds.
+        let mut bad = raw_name("example.com", netwatch_common::FAMILY_V4, a);
+        bad[2] = 200;
+        assert!(decode(&bad).is_none(), "an impossible length was accepted");
+
+        // Zero length: nothing was read at all.
+        let mut empty = raw_name("example.com", netwatch_common::FAMILY_V4, a);
+        empty[2] = 0;
+        assert!(decode(&empty).is_none());
+
+        // Something that is not a hostname.
+        assert!(
+            decode(&raw_name("not a host name!", netwatch_common::FAMILY_V4, a)).is_none(),
+            "an implausible name was accepted"
+        );
+    }
+
+    /// A record whose kind byte is neither is from a version that wrote
+    /// something this one does not know. Skipping it is right; guessing is not.
+    #[test]
+    fn an_unknown_kind_is_skipped() {
+        let mut bytes = raw(DIR_SENT, PROTO_TCP, 1, FAMILY_V4, [0; 16], 1);
+        bytes[0] = 200;
+        assert!(decode(&bytes).is_none());
     }
 }

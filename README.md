@@ -428,6 +428,20 @@ Names come from `/proc/<pid>/exe` rather than from `comm`: the kernel truncates
 `comm` to fifteen characters, and two different programs would quietly become
 the same one.
 
+Peer **names** are read where the lookup happens, with a pair of probes on the
+C library's `getaddrinfo` — the name going in, the addresses coming out. That
+is the same promise the Windows side makes by reading the machine's own DNS
+answers: a name on screen is one a program here actually asked for, never a
+reverse lookup. A program that carries its own resolver instead of using the C
+library — a statically linked Go binary, most obviously — is not seen, and its
+peers stay addresses rather than acquiring a name from somewhere else.
+
+Those two probes read `struct addrinfo`, and its offsets *are* hard-coded,
+which looks inconsistent next to the trouble taken over `struct sock`. The
+difference is the point: `struct sock` is internal to a kernel build and moves
+between them, while `struct addrinfo` is part of the C library's published ABI.
+If it moved, every binary on the system would break, not just this one.
+
 ## Correctness
 
 The failure mode that matters here is not a crash — it is a number that is
@@ -458,7 +472,7 @@ cargo test
 | Limit | Consequence |
 |---|---|
 | Needs privilege | An ETW session needs Administrator; loading an eBPF program needs `CAP_BPF` and `CAP_PERFMON`. Neither question can be asked without them |
-| Linux peers are addresses, not names | Windows reads the machine's own DNS answers through ETW. Linux has no equivalent hooked yet, so a Linux peer is shown as the address it really was |
+| Only looked-up names are shown | A peer is named when a program here resolved it. On Linux that means through the C library; a statically linked Go binary carries its own resolver and is not seen |
 | Only looked-up names are shown | A peer is named when this machine resolved it. Hard-coded addresses, and answers cached before netwatch started, stay addresses |
 | The record starts when you install it | netwatch cannot report on traffic from before it was recording — there is nothing kept anywhere else to read |
 | Times are UTC | The log and the reports use one clock, so a time printed matches a time in the file, wherever the file is read |
@@ -466,9 +480,7 @@ cargo test
 
 ## Roadmap
 
-1. Peer names on Linux — reading the machine's own DNS answers, as the Windows
-   side already does, so a Linux row can say where it went by name.
-2. Alerts — a threshold per program, and a note when one crosses it.
+1. Alerts — a threshold per program, and a note when one crosses it.
 3. A report that compares today against the usual, so "unusual" needs no
    threshold set by hand.
 4. History drawn over hours, not just the last minute.

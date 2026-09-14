@@ -11,6 +11,13 @@
 
 #![no_std]
 
+/// Both records begin with this byte, in the same place, because they share
+/// one ring buffer and the reader has nothing else to go on. They share it
+/// deliberately: a name resolved and the traffic that follows it must keep
+/// their order, and two buffers would race.
+pub const KIND_TRANSFER: u8 = 0;
+pub const KIND_NAME: u8 = 1;
+
 pub const PROTO_TCP: u8 = 0;
 pub const PROTO_UDP: u8 = 1;
 
@@ -48,22 +55,47 @@ pub mod sock {
 pub const AF_INET: u16 = 2;
 pub const AF_INET6: u16 = 10;
 
+/// The most of a hostname that is carried. A longer one is dropped rather
+/// than truncated: half a domain is not a shorter answer, it is a different
+/// and wrong one.
+pub const HOST_MAX: usize = 96;
+
 /// One send or receive, as the kernel saw it happen.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RawTransfer {
-    /// How much moved, in bytes.
-    pub bytes: u64,
+    /// Always `KIND_TRANSFER`.
+    pub kind: u8,
+    pub proto: u8,
+    pub dir: u8,
+    pub family: u8,
     /// The process the kernel charged it to.
     pub pid: u32,
+    /// How much moved, in bytes.
+    pub bytes: u64,
     /// The peer's address, in network byte order. IPv4 uses the first four
     /// bytes; the rest are zero and `family` says which to read.
     pub addr: [u8; 16],
     /// The peer's port, in host byte order — converted in the kernel, where
     /// the value came from, rather than left for the reader to remember.
     pub port: u16,
-    pub proto: u8,
-    pub dir: u8,
+    pub _pad: [u8; 6],
+}
+
+/// An address this machine looked up, and the name it asked for.
+///
+/// Recorded where the lookup happened rather than guessed afterwards: a
+/// reverse lookup invents a name the traffic never mentioned, and for anything
+/// behind a CDN returns something worse than the address it replaced.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RawName {
+    /// Always `KIND_NAME`.
+    pub kind: u8,
     pub family: u8,
-    pub _pad: [u8; 7],
+    /// How many bytes of `host` are used.
+    pub len: u8,
+    pub _pad: [u8; 5],
+    pub addr: [u8; 16],
+    pub host: [u8; HOST_MAX],
 }

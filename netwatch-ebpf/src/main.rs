@@ -29,16 +29,17 @@
 
 use aya_ebpf::helpers::{
     bpf_get_current_pid_tgid, bpf_probe_read_kernel, bpf_probe_read_kernel_buf,
+    bpf_probe_read_user, bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes,
 };
-use aya_ebpf::macros::{kprobe, map};
-use aya_ebpf::maps::{Array, RingBuf};
-use aya_ebpf::programs::ProbeContext;
+use aya_ebpf::macros::{kprobe, map, uprobe, uretprobe};
+use aya_ebpf::maps::{Array, HashMap, RingBuf};
+use aya_ebpf::programs::{ProbeContext, RetProbeContext};
 use aya_ebpf_bindings::bindings::bpf_pidns_info;
 use aya_ebpf_bindings::helpers::bpf_get_ns_current_pid_tgid;
 
 use netwatch_common::{
-    AF_INET, AF_INET6, DIR_RECEIVED, DIR_SENT, FAMILY_V4, FAMILY_V6, PROTO_TCP, PROTO_UDP,
-    RawTransfer, sock,
+    AF_INET, AF_INET6, DIR_RECEIVED, DIR_SENT, FAMILY_V4, FAMILY_V6, HOST_MAX, KIND_NAME,
+    KIND_TRANSFER, PROTO_TCP, PROTO_UDP, RawName, RawTransfer, sock,
 };
 
 /// The pid namespace to report process ids in, as a device number and inode,
@@ -150,14 +151,178 @@ fn emit(sk: u64, bytes: u64, dir: u8, proto: u8) {
     let (addr, port, family) = peer(sk);
 
     entry.write(RawTransfer {
-        bytes,
-        pid: current_tgid(),
-        addr,
-        port,
+        kind: KIND_TRANSFER,
         proto,
         dir,
         family,
-        _pad: [0u8; 7],
+        pid: current_tgid(),
+        bytes,
+        addr,
+        port,
+        _pad: [0u8; 6],
+    });
+    entry.submit(0);
+}
+
+/// What a thread asked `getaddrinfo` for, remembered between the call and its
+/// return — the name is only known going in, and the answer only coming out.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Lookup {
+    /// The name asked for, as a pointer into the calling program.
+    host: u64,
+    /// Where the answer will be written: the `res` out-parameter.
+    res: u64,
+}
+
+/// Keyed by thread, not process: two threads of one program can be resolving
+/// different names at the same time, and keying by process would hand one
+/// thread's answer the other's question.
+#[map]
+static LOOKUPS: HashMap<u64, Lookup> = HashMap::with_max_entries(4096, 0);
+
+/// The layout of glibc's `struct addrinfo` and of the socket addresses it
+/// points at.
+///
+/// These are hard-coded where the kernel's are looked up, and the difference
+/// is the point: `struct sock` is internal to a kernel build and moves between
+/// them, while `struct addrinfo` is part of the C library's published ABI. A
+/// program compiled ten years ago still walks this list the same way; if these
+/// offsets moved, every binary on the system would break, not just this one.
+mod addrinfo {
+    /// `int ai_family`
+    pub const FAMILY: u64 = 4;
+    /// `struct sockaddr *ai_addr`
+    pub const ADDR: u64 = 24;
+    /// `struct addrinfo *ai_next`
+    pub const NEXT: u64 = 40;
+
+    /// `sa_family_t sin_family` — the same first field in both families.
+    pub const SA_FAMILY: u64 = 0;
+    /// `struct in_addr sin_addr`
+    pub const SIN_ADDR: u64 = 4;
+    /// `struct in6_addr sin6_addr`
+    pub const SIN6_ADDR: u64 = 8;
+
+    /// How far down the list to walk. A name with more addresses than this is
+    /// unusual, and the loop has to be bounded for the verifier to accept it
+    /// at all.
+    pub const MAX: usize = 8;
+}
+
+/// Going in: remember the name and where the answer will land.
+#[uprobe]
+pub fn getaddrinfo(ctx: ProbeContext) -> u32 {
+    let (Some(host), Some(res)) = (ctx.arg::<u64>(0), ctx.arg::<u64>(3)) else {
+        return 0;
+    };
+    if host == 0 || res == 0 {
+        return 0;
+    }
+    let _ = LOOKUPS.insert(&bpf_get_current_pid_tgid(), &Lookup { host, res }, 0);
+    0
+}
+
+/// Coming out: if it succeeded, read the name it was asked for and every
+/// address it answered with.
+#[uretprobe]
+pub fn getaddrinfo_ret(ctx: RetProbeContext) -> u32 {
+    let tid = bpf_get_current_pid_tgid();
+    // SAFETY: the key is a plain u64 and the map returns a pointer into its
+    // own storage, read before anything else can remove the entry.
+    let Some(&saved) = (unsafe { LOOKUPS.get(&tid) }) else {
+        return 0;
+    };
+    let _ = LOOKUPS.remove(&tid);
+
+    // Anything other than zero means it failed, and a failed lookup names
+    // nothing.
+    if ctx.ret::<i32>() != 0 {
+        return 0;
+    }
+
+    let mut host = [0u8; HOST_MAX];
+    // SAFETY: the pointer came from the calling program's own arguments and
+    // is read through the helper, which faults safely.
+    let Ok(name) = (unsafe { bpf_probe_read_user_str_bytes(saved.host as *const u8, &mut host) })
+    else {
+        return 0;
+    };
+    let len = name.len();
+    if len == 0 || len >= HOST_MAX {
+        // An empty name says nothing, and one that filled the buffer was
+        // truncated — half a domain is a different domain.
+        return 0;
+    }
+
+    // SAFETY: every dereference below goes through a user probe read.
+    let mut node = match unsafe { bpf_probe_read_user::<u64>(saved.res as *const u64) } {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+
+    for _ in 0..addrinfo::MAX {
+        if node == 0 {
+            break;
+        }
+        // SAFETY: as above — probe reads, which return an error rather than
+        // faulting, on pointers taken from the program's own answer.
+        unsafe {
+            let family = bpf_probe_read_user::<i32>((node + addrinfo::FAMILY) as *const i32);
+            let sa = bpf_probe_read_user::<u64>((node + addrinfo::ADDR) as *const u64);
+            let next = bpf_probe_read_user::<u64>((node + addrinfo::NEXT) as *const u64);
+
+            if let (Ok(family), Ok(sa)) = (family, sa)
+                && sa != 0
+            {
+                emit_name(family as u16, sa, &host, len);
+            }
+            node = next.unwrap_or(0);
+        }
+    }
+    0
+}
+
+/// Put one name-to-address pairing on the ring buffer.
+///
+/// # Safety
+/// `sa` must be a socket address in the calling program, read here only
+/// through user probe reads.
+unsafe fn emit_name(family: u16, sa: u64, host: &[u8; HOST_MAX], len: usize) {
+    let (off, want, mark) = match family {
+        AF_INET => (addrinfo::SIN_ADDR, 4usize, FAMILY_V4),
+        AF_INET6 => (addrinfo::SIN6_ADDR, 16usize, FAMILY_V6),
+        _ => return,
+    };
+
+    let mut addr = [0u8; 16];
+    // SAFETY: the caller's contract, and the helper faults safely regardless.
+    unsafe {
+        // The family is checked against the address itself as well as against
+        // the entry that pointed here; a disagreement means this is not the
+        // structure it was said to be.
+        let Ok(sa_family) = bpf_probe_read_user::<u16>((sa + addrinfo::SA_FAMILY) as *const u16)
+        else {
+            return;
+        };
+        if sa_family != family {
+            return;
+        }
+        if bpf_probe_read_user_buf((sa + off) as *const u8, &mut addr[..want]).is_err() {
+            return;
+        }
+    }
+
+    let Some(mut entry) = EVENTS.reserve::<RawName>(0) else {
+        return;
+    };
+    entry.write(RawName {
+        kind: KIND_NAME,
+        family: mark,
+        len: len as u8,
+        _pad: [0u8; 5],
+        addr,
+        host: *host,
     });
     entry.submit(0);
 }
