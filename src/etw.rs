@@ -38,6 +38,28 @@ const KEYWORD_PROCESS: u64 = 0x10;
 /// reading one of those as a start would report a program's exit as its birth.
 const OPCODE_PROCESS_START: u8 = 1;
 
+/// Microsoft-Windows-Kernel-File, which reports every file opened, with the
+/// name and the intent behind the open.
+const KERNEL_FILE: &str = "edd08927-9cc4-4e65-b970-c2560fb5c289";
+
+/// `KERNEL_FILE_KEYWORD_CREATE`. The provider can also report every read and
+/// every write, which on an idle machine is a flood, and those events carry a
+/// file object rather than a name — the name only ever arrives here.
+const KEYWORD_FILE_CREATE: u64 = 0x80;
+
+/// The `Create` event.
+const EVENT_FILE_CREATE: u16 = 12;
+
+/// `CreateOptions` carries the disposition in its top byte and the options in
+/// the rest. The disposition is what says whether the caller meant to change
+/// the file: everything except `FILE_OPEN` either creates it, replaces it, or
+/// creates it if it is not there.
+///
+/// What this cannot see is a plain `FILE_OPEN` asked for with write access —
+/// the desired access is not in the event. So this reports files created or
+/// replaced, which is most of what "wrote" means and never claims more.
+const DISPOSITION_OPEN: u32 = 1;
+
 /// The name our trace session runs under.
 ///
 /// Fixed, not generated. An ETW session outlives the process that made it: if
@@ -105,6 +127,40 @@ fn decode_start(record: &EventRecord, locator: &SchemaLocator) -> Option<Start> 
         cmdline: crate::procs::command_line(pid),
         user: crate::procs::user_of(pid),
     })
+}
+
+/// A file opened with the intent to change it.
+fn decode_file(record: &EventRecord, locator: &SchemaLocator) -> Option<Event> {
+    if record.event_id() != EVENT_FILE_CREATE {
+        return None;
+    }
+    let schema = locator.event_schema(record).ok()?;
+    let parser = Parser::create(record, &schema);
+
+    let options: u32 = parser.try_parse("CreateOptions").ok()?;
+    if options >> 24 == DISPOSITION_OPEN {
+        return None;
+    }
+
+    let name: String = parser.try_parse("FileName").ok()?;
+    if name.is_empty() || is_own_trace(&name) {
+        return None;
+    }
+
+    // The event carries no process id; the record it arrived in does, and it
+    // is the process that made the call.
+    Some(Event::Wrote {
+        pid: record.process_id(),
+        path: crate::procs::drive_path(&name),
+    })
+}
+
+/// netwatch's own trace session writes its buffer file constantly. Reporting
+/// that would be true, useless, and a little absurd: the tool would spend its
+/// time telling you about itself.
+fn is_own_trace(path: &str) -> bool {
+    let p = path.to_lowercase();
+    p.contains(r"logfiles\wmi\rtbackup") || p.ends_with(".etl")
 }
 
 fn decode(record: &EventRecord, locator: &SchemaLocator) -> Option<Transfer> {
@@ -202,11 +258,23 @@ pub fn start(tx: Sender<Event>) -> Result<UserTrace, String> {
 
     // The third provider on the same session, for the same reason as the
     // second: one session, one ordered stream, one thing to clean up.
+    let starts_tx = tx.clone();
     let starts = Provider::by_guid(KERNEL_PROCESS)
         .any(KEYWORD_PROCESS)
         .add_callback(move |record: &EventRecord, locator: &SchemaLocator| {
             if let Some(s) = decode_start(record, locator) {
-                let _ = tx.send(Event::Started(s));
+                let _ = starts_tx.send(Event::Started(s));
+            }
+        })
+        .build();
+
+    // The fourth provider on the same session, and the last: one session, one
+    // ordered stream, one thing to clean up.
+    let files = Provider::by_guid(KERNEL_FILE)
+        .any(KEYWORD_FILE_CREATE)
+        .add_callback(move |record: &EventRecord, locator: &SchemaLocator| {
+            if let Some(ev) = decode_file(record, locator) {
+                let _ = tx.send(ev);
             }
         })
         .build();
@@ -216,6 +284,7 @@ pub fn start(tx: Sender<Event>) -> Result<UserTrace, String> {
         .enable(traffic)
         .enable(names)
         .enable(starts)
+        .enable(files)
         .start_and_process()
         .map_err(|e| {
             format!(
