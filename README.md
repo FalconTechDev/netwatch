@@ -345,10 +345,17 @@ for them rather than for root is asking for the least that works. If the
 filesystem cannot carry capabilities the installer says so and tells you to use
 `sudo`, rather than leaving you to discover it as a permission error.
 
-Recording at boot is a scheduled task on Windows; the systemd unit that would
-be its counterpart is not written yet, so on Linux `netwatch record` is run by
-hand for now — and the program says that, instead of naming a subcommand it
-does not have.
+`netwatch service install` arranges recording from every boot here too, as a
+systemd unit. It asks for `CAP_BPF` and `CAP_PERFMON` rather than running as
+root outright, and is restarted if it ever stops — a recorder that died in the
+night leaves a gap exactly where the answer should have been.
+
+That confinement has a sharp edge worth knowing about: dropping everything but
+those two capabilities takes `CAP_DAC_OVERRIDE` away from root, so the service
+can only write a directory it owns. The unit therefore lets systemd create and
+hand over `/var/log/netwatch`. The first version did not, and it started,
+reported itself active and enabled, and logged "Permission denied" once a
+minute while recording nothing at all.
 
 Needs a kernel with BTF (`CONFIG_DEBUG_INFO_BTF`), which every current
 distribution ships. The installer checks and warns before it installs anything.
@@ -385,6 +392,23 @@ a small program loaded into it:
 * **`tcp_cleanup_rbuf`** is the receive side — not `tcp_recvmsg`, which is
   entered *before* it knows how much it will return. The count only exists on
   the way out.
+* **`udp_sendmsg`** and **`udpv6_sendmsg`** are the same for UDP, which needs
+  both because the two families have separate send paths, and
+  **`skb_consume_udp`** is its receive side, chosen over `udp_recvmsg` for the
+  same reason: it is handed the socket and the length together.
+
+The far end of each transfer is read out of `struct sock`, and where those
+fields sit differs between kernel builds — a config option flipped, a distro
+patch, and a field moves. Offsets compiled in would read whatever now lives at
+the old address and report it as an answer. So netwatch parses the kernel's own
+`/sys/kernel/btf/vmlinux` at startup, finds the offsets on the machine it is
+about to run on, and passes them to the program through a map. That is the same
+idea as libbpf's CO-RE, done by hand and only as far as it needs to go.
+
+A socket with no far end recorded on it — an unconnected UDP socket — is
+reported as having no peer, rather than as `0.0.0.0:0`. The bytes are real and
+stay counted against the program; where they went is simply not something this
+saw.
 
 Both are entry probes in the kernel's hot path, so the work done there is a few
 loads and a write into a ring buffer; anything slower would be felt by every
@@ -434,9 +458,7 @@ cargo test
 | Limit | Consequence |
 |---|---|
 | Needs privilege | An ETW session needs Administrator; loading an eBPF program needs `CAP_BPF` and `CAP_PERFMON`. Neither question can be asked without them |
-| Linux shows no peer addresses yet | Byte counts and processes are right; reading the socket's far end needs field offsets for the running kernel, which is the next piece of work |
-| Linux counts TCP only | UDP has its own pair of kernel functions and is not hooked yet |
-| Linux has no boot-time recorder | Windows registers a scheduled task; the systemd unit for Linux is not written, so `netwatch record` is started by hand there |
+| Linux peers are addresses, not names | Windows reads the machine's own DNS answers through ETW. Linux has no equivalent hooked yet, so a Linux peer is shown as the address it really was |
 | Only looked-up names are shown | A peer is named when this machine resolved it. Hard-coded addresses, and answers cached before netwatch started, stay addresses |
 | The record starts when you install it | netwatch cannot report on traffic from before it was recording — there is nothing kept anywhere else to read |
 | Times are UTC | The log and the reports use one clock, so a time printed matches a time in the file, wherever the file is read |
@@ -444,14 +466,12 @@ cargo test
 
 ## Roadmap
 
-1. Peer addresses on Linux — reading the socket's far end in the kernel, so a
-   Linux row says where it went, as the Windows one already does.
-2. UDP on Linux, which is the other half of the traffic.
-3. A systemd unit, so Linux records from boot the way Windows does.
-4. Alerts — a threshold per program, and a note when one crosses it.
-5. A report that compares today against the usual, so "unusual" needs no
+1. Peer names on Linux — reading the machine's own DNS answers, as the Windows
+   side already does, so a Linux row can say where it went by name.
+2. Alerts — a threshold per program, and a note when one crosses it.
+3. A report that compares today against the usual, so "unusual" needs no
    threshold set by hand.
-6. History drawn over hours, not just the last minute.
+4. History drawn over hours, not just the last minute.
 
 ## License
 

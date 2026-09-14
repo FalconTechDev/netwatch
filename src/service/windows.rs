@@ -1,8 +1,4 @@
-//! Starting at boot.
-//!
-//! Recording only helps if it was running when the thing you want to know
-//! about happened, which means starting without being asked — before anyone
-//! logs in, and without a window.
+//! Recording from every boot, the way Windows arranges it.
 //!
 //! A scheduled task rather than a Run key: the Run key starts programs after
 //! login, unelevated, in the user's session. netwatch needs to be running
@@ -18,35 +14,8 @@
 
 use std::process::Command;
 
-use clap::Subcommand;
-
 const TASK: &str = "netwatch";
 const TRAY_TASK: &str = "netwatch-tray";
-
-#[derive(Subcommand)]
-pub enum Action {
-    /// Record from every boot, as a scheduled task running under SYSTEM.
-    Install {
-        /// Delete day files older than this.
-        #[arg(long, default_value_t = 30)]
-        keep_days: u64,
-        /// Register the task but wait for the next boot to start recording.
-        #[arg(long)]
-        later: bool,
-    },
-    /// Stop recording at boot and remove the task.
-    Uninstall,
-    /// Whether the task exists, and when it last ran.
-    Status,
-}
-
-pub fn run(action: Action) -> Result<(), String> {
-    match action {
-        Action::Install { keep_days, later } => install(keep_days, later),
-        Action::Uninstall => uninstall(),
-        Action::Status => status(),
-    }
-}
 
 fn schtasks(args: &[&str]) -> Result<String, String> {
     let out = Command::new("schtasks")
@@ -230,7 +199,7 @@ fn register(name: &str, xml: &str) -> Result<(), String> {
     result.map(|_| ())
 }
 
-fn install(keep_days: u64, later: bool) -> Result<(), String> {
+pub fn install(keep_days: u64, later: bool) -> Result<(), String> {
     let exe =
         std::env::current_exe().map_err(|e| format!("could not find this executable: {e}"))?;
     let exe = exe.display().to_string();
@@ -284,7 +253,7 @@ fn install(keep_days: u64, later: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn uninstall() -> Result<(), String> {
+pub fn uninstall() -> Result<(), String> {
     // The tray first, and quietly: it may not be there, and its absence is not
     // a reason to refuse to remove the recorder.
     let _ = schtasks(&["/delete", "/tn", TRAY_TASK, "/f"]);
@@ -299,7 +268,7 @@ fn uninstall() -> Result<(), String> {
     Ok(())
 }
 
-fn status() -> Result<(), String> {
+pub fn status() -> Result<(), String> {
     match schtasks(&["/query", "/tn", TASK, "/v", "/fo", "LIST"]) {
         Ok(text) => {
             // The full listing is forty lines of which five matter, and the

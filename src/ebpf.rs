@@ -21,16 +21,19 @@ use std::time::Duration;
 use aya::maps::RingBuf;
 use aya::programs::KProbe;
 
-use netwatch_common::{DIR_SENT, FAMILY_V6, PROTO_UDP, RawTransfer};
+use netwatch_common::{DIR_SENT, FAMILY_V6, PROTO_UDP, RawTransfer, sock};
 
 use crate::event::{Dir, Event, Proto, Transfer};
 
-/// The kernel functions the two probes attach to. Named here rather than at
-/// the point of use so that the pair reads as one decision: every TCP byte in
-/// the system passes through one of these.
-const PROBES: [(&str, &str); 2] = [
+/// The programs in the object, and the kernel function each attaches to.
+/// Listed here rather than at the point of use so the set reads as one
+/// decision: every byte in the system passes through one of these.
+const PROBES: [(&str, &str); 5] = [
     ("tcp_sendmsg", "tcp_sendmsg"),
     ("tcp_cleanup_rbuf", "tcp_cleanup_rbuf"),
+    ("udp_sendmsg", "udp_sendmsg"),
+    ("udpv6_sendmsg", "udpv6_sendmsg"),
+    ("skb_consume_udp", "skb_consume_udp"),
 ];
 
 /// A running trace. Dropping it — or calling `stop` — detaches the probes and
@@ -82,6 +85,7 @@ pub fn start(tx: Sender<Event>) -> Result<Session, String> {
     })?;
 
     tell_kernel_our_namespace(&mut ebpf)?;
+    tell_kernel_where_its_fields_are(&mut ebpf);
 
     for (program, function) in PROBES {
         let probe: &mut KProbe = ebpf
@@ -118,6 +122,67 @@ pub fn start(tx: Sender<Event>) -> Result<Session, String> {
         stop,
         reader: Some(reader),
     })
+}
+
+/// Tell the eBPF program where this kernel keeps the `struct sock` fields it
+/// reads, by looking them up in the kernel's own BTF.
+///
+/// Failing is not fatal. Without the offsets the program reports no peer, and
+/// the byte counts and processes — which is most of what netwatch is for —
+/// are unaffected. Refusing to start at all over a missing address would trade
+/// a partial answer for none.
+///
+/// This is called before the probes are attached, and the ready flag is
+/// written last, so a probe can never run against half a set of offsets.
+fn tell_kernel_where_its_fields_are(ebpf: &mut aya::Ebpf) {
+    let btf = match crate::btf::Btf::from_running_kernel() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("netwatch: peers will be unnamed — {e}");
+            return;
+        }
+    };
+
+    let at = |field: &str| btf.offset_of("sock", &["__sk_common", field]);
+    let (family, daddr, dport) = match (at("skc_family"), at("skc_daddr"), at("skc_dport")) {
+        (Ok(f), Ok(d), Ok(p)) => (f, d, p),
+        _ => {
+            eprintln!(
+                "netwatch: this kernel's struct sock is not shaped as expected;                  traffic will be reported without peer addresses."
+            );
+            return;
+        }
+    };
+    // A kernel built without IPv6 has no such field, which is not a problem
+    // until an IPv6 socket appears — and on such a kernel none will. The
+    // sentinel is shared with the eBPF side so it cannot be read as an offset;
+    // zero would have been a plausible one.
+    let daddr6 = at("skc_v6_daddr")
+        .map(u64::from)
+        .unwrap_or(netwatch_common::sock::NO_FIELD);
+
+    let mut map: aya::maps::Array<_, u64> = match ebpf.map_mut("SOCK").map(TryInto::try_into) {
+        Some(Ok(m)) => m,
+        _ => {
+            eprintln!("netwatch: the eBPF object has no usable SOCK map");
+            return;
+        }
+    };
+
+    let slots = [
+        (sock::FAMILY, family as u64),
+        (sock::DADDR, daddr as u64),
+        (sock::DPORT, dport as u64),
+        (sock::DADDR6, daddr6),
+    ];
+    for (slot, value) in slots {
+        if let Err(e) = map.set(slot, value, 0) {
+            eprintln!("netwatch: could not pass a field offset to the kernel: {e}");
+            return;
+        }
+    }
+    // Last, and only once every offset above is in place.
+    let _ = map.set(sock::READY, 1, 0);
 }
 
 /// Tell the eBPF program which pid namespace to count in: this one.

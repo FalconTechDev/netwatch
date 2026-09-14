@@ -1,7 +1,7 @@
 //! What runs inside the kernel.
 //!
-//! Two probes, one for each direction, on the functions every TCP byte in the
-//! system passes through:
+//! Probes on the functions every byte in the system passes through, one pair
+//! per protocol and direction:
 //!
 //! * `tcp_sendmsg(sk, msg, size)` — called once per send, with the byte count
 //!   as its third argument.
@@ -10,6 +10,11 @@
 //!   the receive side's counterpart rather than `tcp_recvmsg`, because
 //!   `tcp_recvmsg` is entered before it knows how much it will return; the
 //!   count is only known on the way out.
+//! * `udp_sendmsg` and `udpv6_sendmsg` — the same for UDP, which needs both
+//!   because the two families have separate send paths.
+//! * `skb_consume_udp(sk, skb, len)` — the UDP receive side, and the reason
+//!   `udp_recvmsg` is not used: this one is handed the socket and the length
+//!   together, where `udp_recvmsg` again knows the length only on the way out.
 //!
 //! Both are entry probes, so the work done here is a few loads and a write
 //! into a ring buffer — the kernel is blocked in a hot path while this runs,
@@ -22,14 +27,19 @@
 #![no_std]
 #![no_main]
 
-use aya_ebpf::helpers::bpf_get_current_pid_tgid;
+use aya_ebpf::helpers::{
+    bpf_get_current_pid_tgid, bpf_probe_read_kernel, bpf_probe_read_kernel_buf,
+};
 use aya_ebpf::macros::{kprobe, map};
 use aya_ebpf::maps::{Array, RingBuf};
 use aya_ebpf::programs::ProbeContext;
 use aya_ebpf_bindings::bindings::bpf_pidns_info;
 use aya_ebpf_bindings::helpers::bpf_get_ns_current_pid_tgid;
 
-use netwatch_common::{DIR_RECEIVED, DIR_SENT, FAMILY_V4, PROTO_TCP, RawTransfer};
+use netwatch_common::{
+    AF_INET, AF_INET6, DIR_RECEIVED, DIR_SENT, FAMILY_V4, FAMILY_V6, PROTO_TCP, PROTO_UDP,
+    RawTransfer, sock,
+};
 
 /// The pid namespace to report process ids in, as a device number and inode,
 /// written here by the program that loads this one.
@@ -46,6 +56,11 @@ use netwatch_common::{DIR_RECEIVED, DIR_SENT, FAMILY_V4, PROTO_TCP, RawTransfer}
 #[map]
 static PIDNS: Array<u64> = Array::with_max_entries(2, 0);
 
+/// Byte offsets of the `struct sock` fields read below, filled in by the
+/// loader from this kernel's own BTF. See `netwatch_common::sock`.
+#[map]
+static SOCK: Array<u64> = Array::with_max_entries(sock::SLOTS, 0);
+
 /// Where events go on their way out. A ring buffer rather than a perf buffer:
 /// it is shared across CPUs, so events keep their order, which is what lets a
 /// name be recorded before the traffic it belongs to.
@@ -58,11 +73,14 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
 #[kprobe]
 pub fn tcp_sendmsg(ctx: ProbeContext) -> u32 {
-    // Third argument: the number of bytes handed to the kernel.
+    // First argument: the socket. Third: the number of bytes handed to it.
+    let Some(sk) = ctx.arg::<u64>(0) else {
+        return 0;
+    };
     let Some(size) = ctx.arg::<usize>(2) else {
         return 0;
     };
-    emit(size as u64, DIR_SENT);
+    emit(sk, size as u64, DIR_SENT, PROTO_TCP);
     0
 }
 
@@ -70,36 +88,144 @@ pub fn tcp_sendmsg(ctx: ProbeContext) -> u32 {
 pub fn tcp_cleanup_rbuf(ctx: ProbeContext) -> u32 {
     // Second argument: bytes copied to the process. It is signed and is zero
     // or negative on the calls that moved nothing, which are the majority.
+    let Some(sk) = ctx.arg::<u64>(0) else {
+        return 0;
+    };
     let Some(copied) = ctx.arg::<i32>(1) else {
         return 0;
     };
     if copied <= 0 {
         return 0;
     }
-    emit(copied as u64, DIR_RECEIVED);
+    emit(sk, copied as u64, DIR_RECEIVED, PROTO_TCP);
+    0
+}
+
+#[kprobe]
+pub fn udp_sendmsg(ctx: ProbeContext) -> u32 {
+    udp_send(ctx)
+}
+
+/// IPv6 has its own send path, so it needs its own probe; the receive side is
+/// shared between the two families and does not.
+#[kprobe]
+pub fn udpv6_sendmsg(ctx: ProbeContext) -> u32 {
+    udp_send(ctx)
+}
+
+fn udp_send(ctx: ProbeContext) -> u32 {
+    let Some(sk) = ctx.arg::<u64>(0) else {
+        return 0;
+    };
+    let Some(len) = ctx.arg::<usize>(2) else {
+        return 0;
+    };
+    emit(sk, len as u64, DIR_SENT, PROTO_UDP);
+    0
+}
+
+#[kprobe]
+pub fn skb_consume_udp(ctx: ProbeContext) -> u32 {
+    let Some(sk) = ctx.arg::<u64>(0) else {
+        return 0;
+    };
+    // Third argument: how much was handed to the process. Negative on the
+    // paths that delivered nothing.
+    let Some(len) = ctx.arg::<i32>(2) else {
+        return 0;
+    };
+    if len <= 0 {
+        return 0;
+    }
+    emit(sk, len as u64, DIR_RECEIVED, PROTO_UDP);
     0
 }
 
 /// Put one transfer on the ring buffer, or drop it if there is no room.
-fn emit(bytes: u64, dir: u8) {
+fn emit(sk: u64, bytes: u64, dir: u8, proto: u8) {
     let Some(mut entry) = EVENTS.reserve::<RawTransfer>(0) else {
         return;
     };
 
+    let (addr, port, family) = peer(sk);
+
     entry.write(RawTransfer {
         bytes,
         pid: current_tgid(),
-        // The peer is not read yet: reaching into `struct sock` needs field
-        // offsets for the running kernel, which is the next step. Until then
-        // every byte is still charged to the right process.
-        addr: [0u8; 16],
-        port: 0,
-        proto: PROTO_TCP,
+        addr,
+        port,
+        proto,
         dir,
-        family: FAMILY_V4,
+        family,
         _pad: [0u8; 7],
     });
     entry.submit(0);
+}
+
+/// The far end of a socket: its address and port, read out of `struct sock`
+/// at the offsets the loader found.
+///
+/// Returns a zero address when the offsets are not in place or a read faults.
+/// That is reported as "no peer" rather than as address zero, because a made-up
+/// address is indistinguishable from a real one once it leaves here.
+fn peer(sk: u64) -> ([u8; 16], u16, u8) {
+    let none = ([0u8; 16], 0u16, FAMILY_V4);
+
+    if SOCK.get(sock::READY).copied() != Some(1) {
+        return none;
+    }
+    let (Some(&off_family), Some(&off_daddr), Some(&off_dport), Some(&off_daddr6)) = (
+        SOCK.get(sock::FAMILY),
+        SOCK.get(sock::DADDR),
+        SOCK.get(sock::DPORT),
+        SOCK.get(sock::DADDR6),
+    ) else {
+        return none;
+    };
+
+    // SAFETY: every read goes through bpf_probe_read_kernel, which faults
+    // safely and returns an error rather than touching bad memory. `sk` is
+    // whatever the kernel passed as the socket; nothing here dereferences it
+    // directly.
+    unsafe {
+        let Ok(family) = bpf_probe_read_kernel::<u16>((sk + off_family) as *const u16) else {
+            return none;
+        };
+
+        // The port is stored the way it goes on the wire. Swapping it here,
+        // where the byte order is known, means nothing downstream has to
+        // remember that it was ever big-endian.
+        let Ok(dport) = bpf_probe_read_kernel::<u16>((sk + off_dport) as *const u16) else {
+            return none;
+        };
+        let port = u16::from_be(dport);
+
+        let mut addr = [0u8; 16];
+        match family {
+            AF_INET => {
+                if bpf_probe_read_kernel_buf((sk + off_daddr) as *const u8, &mut addr[..4]).is_err()
+                {
+                    return none;
+                }
+                (addr, port, FAMILY_V4)
+            }
+            AF_INET6 => {
+                // This kernel was built without IPv6, so there is no field to
+                // read. Adding the sentinel to the pointer would read whatever
+                // happens to sit there.
+                if off_daddr6 == sock::NO_FIELD {
+                    return none;
+                }
+                if bpf_probe_read_kernel_buf((sk + off_daddr6) as *const u8, &mut addr).is_err() {
+                    return none;
+                }
+                (addr, port, FAMILY_V6)
+            }
+            // A unix socket, or anything else that is not IP. It moved bytes,
+            // and that is still worth reporting against the process.
+            _ => none,
+        }
+    }
 }
 
 /// The process id of whoever is running, counted the way the watching program

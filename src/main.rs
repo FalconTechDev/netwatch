@@ -10,10 +10,8 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 
-#[cfg(windows)]
-use netwatch::service;
 use netwatch::state::State;
-use netwatch::{bytes, hidden, log, report, source, trunc, tui};
+use netwatch::{bytes, hidden, log, report, service, source, trunc, tui};
 
 #[derive(Parser)]
 #[command(
@@ -59,9 +57,7 @@ enum Cmd {
         #[arg(long)]
         clear: bool,
     },
-    /// Start recording at boot, or stop doing so. Windows only for now:
-    /// Linux would want a systemd unit, which is not written yet.
-    #[cfg(windows)]
+    /// Start recording at boot, or stop doing so.
     Service {
         #[command(subcommand)]
         action: service::Action,
@@ -89,7 +85,6 @@ fn main() -> Result<(), String> {
             dir,
         } => report::run(&dir.unwrap_or_else(log::default_dir), hours, program, top),
         Cmd::Hidden { clear } => hidden_list(clear),
-        #[cfg(windows)]
         Cmd::Service { action } => service::run(action),
     }
 }

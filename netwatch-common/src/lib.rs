@@ -20,6 +20,34 @@ pub const DIR_RECEIVED: u8 = 1;
 pub const FAMILY_V4: u8 = 4;
 pub const FAMILY_V6: u8 = 6;
 
+/// Where the eBPF program finds the offsets of the `struct sock` fields it
+/// reads. The program that loads it looks them up in the running kernel's own
+/// BTF and writes them here before attaching anything, because the offsets
+/// differ between kernel builds and a guess would be read as an answer.
+///
+/// Slot `READY` is written last and gates the rest: a program that started
+/// before the offsets arrived must report no peer rather than read address
+/// zero and call it one.
+pub mod sock {
+    pub const READY: u32 = 0;
+    pub const FAMILY: u32 = 1;
+    pub const DADDR: u32 = 2;
+    pub const DPORT: u32 = 3;
+    pub const DADDR6: u32 = 4;
+    /// How many slots the map needs.
+    pub const SLOTS: u32 = 5;
+
+    /// Written in place of an offset for a field this kernel does not have,
+    /// such as `skc_v6_daddr` on a build without IPv6. It has to be a value no
+    /// real offset can take: zero is a perfectly ordinary offset.
+    pub const NO_FIELD: u64 = u64::MAX;
+}
+
+/// The address families as the kernel numbers them, which is not the same
+/// numbering this program uses on the wire to userspace.
+pub const AF_INET: u16 = 2;
+pub const AF_INET6: u16 = 10;
+
 /// One send or receive, as the kernel saw it happen.
 #[repr(C)]
 #[derive(Clone, Copy)]

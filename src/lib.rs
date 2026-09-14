@@ -21,6 +21,8 @@ pub mod tui;
 // Each of these produces the same `event::Event` stream; everything above them
 // is the same code on both.
 #[cfg(target_os = "linux")]
+pub mod btf;
+#[cfg(target_os = "linux")]
 pub mod ebpf;
 #[cfg(windows)]
 pub mod etw;
@@ -32,23 +34,15 @@ pub use ebpf as source;
 #[cfg(windows)]
 pub use etw as source;
 
-/// How to start recording on this system, wherever that is suggested.
-///
-/// Windows registers a scheduled task that runs from every boot. Linux has no
-/// equivalent here yet, and naming one would send someone to a subcommand that
-/// does not exist on their machine — so what is offered there is the thing
-/// that does work today. A wrong instruction is worse than a modest one: it
-/// costs the reader the time to find out it was wrong.
-#[cfg(windows)]
+/// How to start recording, wherever that is suggested. One command on both
+/// systems now, whatever each arranges underneath.
 pub const HOW_TO_RECORD: &str = "netwatch service install";
-#[cfg(not(windows))]
-pub const HOW_TO_RECORD: &str = "netwatch record";
 
-// Starting at boot and sitting in the tray are both done the way Windows does
-// them — a scheduled task and a notification icon. Linux has its own answers
-// (a systemd unit, a StatusNotifierItem), which are not written yet.
-#[cfg(windows)]
+/// Recording from boot: a scheduled task on Windows, a systemd unit on Linux.
 pub mod service;
+
+// The tray is a Windows notification icon. Linux has its own answer to the
+// same idea (a StatusNotifierItem), which is not written yet.
 #[cfg(windows)]
 pub mod tray;
 

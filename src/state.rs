@@ -164,6 +164,20 @@ impl State {
         });
 
         proc.last_seen = now;
+        match ev.dir {
+            Dir::Sent => proc.traffic.sent += ev.bytes,
+            Dir::Received => proc.traffic.received += ev.bytes,
+        }
+
+        // An unspecified address is not a peer. A UDP socket that was never
+        // connected carries no far end, and putting 0.0.0.0:0 on the screen
+        // would name a destination the traffic did not go to — the bytes are
+        // real and stay counted against the program, but where they went is
+        // not something this saw.
+        if ev.peer.is_unspecified() && ev.peer_port == 0 {
+            return;
+        }
+
         let known = self.hosts.get(&ev.peer).cloned();
         let peer = proc.peers.entry(ev.peer).or_insert_with(|| Peer {
             addr: ev.peer,
@@ -180,14 +194,8 @@ impl State {
         peer.port = ev.peer_port;
 
         match ev.dir {
-            Dir::Sent => {
-                proc.traffic.sent += ev.bytes;
-                peer.traffic.sent += ev.bytes;
-            }
-            Dir::Received => {
-                proc.traffic.received += ev.bytes;
-                peer.traffic.received += ev.bytes;
-            }
+            Dir::Sent => peer.traffic.sent += ev.bytes,
+            Dir::Received => peer.traffic.received += ev.bytes,
         }
     }
 
@@ -408,6 +416,49 @@ mod tests {
             addr: IpAddr::V4(Ipv4Addr::from(peer)),
             host: host.into(),
         }
+    }
+
+    /// A UDP socket that was never connected has no far end recorded on it,
+    /// so the kernel reports the address as unspecified. The bytes are real
+    /// and belong to the program; the destination is not known and must not be
+    /// invented — 0.0.0.0:0 on screen reads as somewhere it actually went.
+    #[test]
+    fn traffic_with_no_known_destination_is_counted_but_not_given_a_peer() {
+        let mut s = State::new();
+        s.apply(Event::Transfer(Transfer {
+            pid: 7,
+            proto: Proto::Udp,
+            dir: Dir::Sent,
+            bytes: 956,
+            peer: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            peer_port: 0,
+        }));
+
+        let ranked = s.ranked(false);
+        let p = ranked.first().expect("the program is still listed");
+        assert_eq!(p.traffic.sent, 956, "the bytes are counted");
+        assert!(
+            p.peers.is_empty(),
+            "but nowhere is named as their destination"
+        );
+        assert_eq!(s.total.sent, 956);
+    }
+
+    /// A real address that merely happens to use port 0 is still a place, and
+    /// so is an unspecified address with a port. Only the pair means "unknown".
+    #[test]
+    fn a_real_address_is_kept_even_on_an_odd_port() {
+        let mut s = State::new();
+        s.apply(Event::Transfer(Transfer {
+            pid: 8,
+            proto: Proto::Udp,
+            dir: Dir::Sent,
+            bytes: 10,
+            peer: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            peer_port: 0,
+        }));
+        let ranked = s.ranked(false);
+        assert_eq!(ranked.first().expect("listed").peers.len(), 1);
     }
 
     /// A name is only worth showing if it is the one the machine asked for.
