@@ -81,6 +81,11 @@ pub struct MinuteRow {
     pub sent: u64,
     pub received: u64,
     pub peers: String,
+    /// What started it, as `name (pid)`, and what it was told to do. Written
+    /// with the traffic because neither can be recovered later: by the time
+    /// the log is read the process is gone.
+    pub parent: String,
+    pub cmdline: String,
 }
 
 /// How many ticks of rate history each process keeps. At one tick a second
@@ -477,10 +482,16 @@ impl State {
             }
             peers.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
             peers.truncate(top_peers);
+            let origin = self.starts.get(&p.pid);
             out.push(MinuteRow {
                 pid: p.pid,
                 name: p.name.clone(),
                 path: p.info.path.clone(),
+                parent: origin
+                    .filter(|o| o.parent != 0)
+                    .map(|o| format!("{} ({})", o.parent_name, o.parent))
+                    .unwrap_or_default(),
+                cmdline: origin.map(|o| o.cmdline.clone()).unwrap_or_default(),
                 sent,
                 received,
                 peers: peers

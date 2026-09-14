@@ -103,7 +103,7 @@ fn decode_start(record: &EventRecord, locator: &SchemaLocator) -> Option<Start> 
         // Not carried by the event, so it is read from the process itself
         // while it is still there to read.
         cmdline: crate::procs::command_line(pid),
-        user: String::new(),
+        user: crate::procs::user_of(pid),
     })
 }
 

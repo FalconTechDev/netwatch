@@ -149,6 +149,9 @@ fn top(seconds: u64, by_total: bool) -> Result<(), String> {
             if !o.path.is_empty() && o.path != p.info.path {
                 println!("{:<26} from {}", "", o.path);
             }
+            if !o.user.is_empty() {
+                println!("{:<26} as {}", "", o.user);
+            }
         }
         let chain = st.ancestry(p.pid);
         if !chain.is_empty() {
@@ -239,6 +242,8 @@ fn record(dir: std::path::PathBuf, keep_days: u64) -> Result<(), String> {
                     received: r.received,
                     peers: r.peers,
                     path: r.path,
+                    parent: r.parent,
+                    cmdline: r.cmdline,
                 })
                 .collect();
             let moved: u64 = rows.iter().map(|r| r.sent + r.received).sum();

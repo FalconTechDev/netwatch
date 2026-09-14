@@ -519,6 +519,102 @@ pub fn command_line(_pid: u32) -> String {
     String::new()
 }
 
+/// Who a process runs as, as `DOMAIN\\name`.
+///
+/// Windows keeps this in the process's access token rather than anywhere the
+/// kernel reports it, so the token is opened, its user SID read, and the SID
+/// looked up. Three steps, each of which can fail for an ordinary reason.
+///
+/// Empty when the process has gone or will not be opened — the kernel's own
+/// will not be, even for an administrator. This races a program that lives for
+/// a few milliseconds, and losing that race is better than holding the process
+/// open to win it.
+#[cfg(windows)]
+pub fn user_of(pid: u32) -> String {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, LookupAccountSidW, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: both handles are checked and closed on every path out, and each
+    // buffer is passed with its own length for the API to fill.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return String::new();
+        }
+
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(process, TOKEN_QUERY, &raw mut token) == 0 {
+            CloseHandle(process);
+            return String::new();
+        }
+
+        // A TOKEN_USER is a fixed header followed by the SID it points at, so
+        // the buffer has to hold both — hence asking the size first rather
+        // than assuming one.
+        let mut needed = 0u32;
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &raw mut needed);
+        if needed == 0 {
+            CloseHandle(token);
+            CloseHandle(process);
+            return String::new();
+        }
+        let mut buf = vec![0u8; needed as usize];
+        let ok = GetTokenInformation(
+            token,
+            TokenUser,
+            buf.as_mut_ptr().cast(),
+            needed,
+            &raw mut needed,
+        );
+        CloseHandle(token);
+        CloseHandle(process);
+        if ok == 0 {
+            return String::new();
+        }
+
+        let sid = (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid;
+        if sid.is_null() {
+            return String::new();
+        }
+
+        let mut name = [0u16; 256];
+        let mut domain = [0u16; 256];
+        let mut name_len = name.len() as u32;
+        let mut domain_len = domain.len() as u32;
+        let mut kind: SID_NAME_USE = 0;
+        if LookupAccountSidW(
+            std::ptr::null(),
+            sid,
+            name.as_mut_ptr(),
+            &raw mut name_len,
+            domain.as_mut_ptr(),
+            &raw mut domain_len,
+            &raw mut kind,
+        ) == 0
+        {
+            return String::new();
+        }
+
+        let user = String::from_utf16_lossy(&name[..name_len as usize]);
+        let domain = String::from_utf16_lossy(&domain[..domain_len as usize]);
+        if domain.is_empty() {
+            user
+        } else {
+            format!("{domain}\\{user}")
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn user_of(_pid: u32) -> String {
+    String::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -32,6 +32,14 @@ pub struct Row {
     /// nothing, and by the time anyone reads the log the process is long gone
     /// and cannot be asked.
     pub path: String,
+    /// What started it, as `name (pid)`. Empty when netwatch was not watching
+    /// when it started — which is every process already running when the
+    /// recorder came up, and is a different thing from having no parent.
+    pub parent: String,
+    /// The whole command it was given. Often the only thing that separates two
+    /// programs of the same name, and the reader cannot ask afterwards: by the
+    /// time anyone looks at a log, the process is long gone.
+    pub cmdline: String,
 }
 
 impl Row {
@@ -40,7 +48,7 @@ impl Row {
     }
 }
 
-const HEADER: &str = "# minute\tpid\tname\tsent\treceived\tpeers\tpath";
+const HEADER: &str = "# minute\tpid\tname\tsent\treceived\tpeers\tpath\tstarted_by\tcommand";
 
 /// Where the record lives.
 ///
@@ -173,14 +181,16 @@ impl Writer {
         for r in rows {
             writeln!(
                 f,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 r.minute,
                 r.pid,
                 sanitise(&r.name),
                 r.sent,
                 r.received,
                 sanitise(&r.peers),
-                sanitise(&r.path)
+                sanitise(&r.path),
+                sanitise(&r.parent),
+                sanitise(&r.cmdline)
             )?;
         }
         f.flush()
@@ -249,8 +259,11 @@ fn parse(line: &str) -> Option<Row> {
         peers: f.next().unwrap_or("").to_string(),
         // Absent in files written before paths were recorded. Those rows are
         // still perfectly good rows, so a missing column reads as empty rather
-        // than as a parse failure that would discard the whole day.
+        // than as a parse failure that would discard the whole day. The same
+        // goes for the two after it, added later still.
         path: f.next().unwrap_or("").to_string(),
+        parent: f.next().unwrap_or("").to_string(),
+        cmdline: f.next().unwrap_or("").to_string(),
     };
     Some(row)
 }
@@ -323,6 +336,8 @@ mod tests {
             received,
             peers: "1.2.3.4:443=100".into(),
             path: "C:/app/thing.exe".into(),
+            parent: "explorer.exe (100)".into(),
+            cmdline: "thing.exe --go".into(),
         }
     }
 
@@ -341,6 +356,28 @@ mod tests {
         assert_eq!(back.len(), 2);
         assert_eq!(back[0], rows[0]);
         assert_eq!(back[1].sent, 50_000);
+    }
+
+    /// Columns were appended, not inserted, so a file written by an older
+    /// netwatch still reads. Discarding a day of history because it predates a
+    /// feature would be the worst possible way to add one.
+    #[test]
+    fn a_file_without_the_newer_columns_still_reads() {
+        let dir = tmp("old_format");
+        let path = dir.join("netwatch-2026-01-01.tsv");
+        // Built from parts so the literal cannot pick up the indentation of
+        // the source, which is exactly what silently broke this test once.
+        let header = "# minute\tpid\tname\tsent\treceived\tpeers\tpath";
+        let line = "28333333\t100\tfirefox.exe\t1000\t9000\t1.2.3.4:443=100\tC:/app/f.exe";
+        fs::write(&path, format!("{header}\n{line}\n")).unwrap();
+
+        let back = read_range(&dir, 0, u64::MAX);
+        assert_eq!(back.len(), 1, "an older file was discarded entirely");
+        assert_eq!(back[0].name, "firefox.exe");
+        assert_eq!(back[0].sent, 1_000);
+        // Absent, and read as absent rather than as a parse failure.
+        assert_eq!(back[0].parent, "");
+        assert_eq!(back[0].cmdline, "");
     }
 
     #[test]

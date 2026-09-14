@@ -263,6 +263,32 @@ fn one_program(rows: &[Row], name: &str, hours: u64) {
     if paths.len() > 1 {
         println!("  (more than one executable answered to this name)");
     }
+
+    // What set it off, and what it was told to do. Both were recorded as they
+    // happened, because neither can be recovered at report time: the process
+    // is gone, and so is its parent.
+    let parents: BTreeSet<&str> = mine
+        .iter()
+        .map(|r| r.parent.as_str())
+        .filter(|p| !p.is_empty())
+        .collect();
+    for p in &parents {
+        println!("  started by {p}");
+    }
+
+    // Distinct commands, not one per row: a program running for an hour
+    // writes sixty rows of the identical command line.
+    let commands: BTreeSet<&str> = mine
+        .iter()
+        .map(|r| r.cmdline.as_str())
+        .filter(|c| !c.is_empty())
+        .collect();
+    for c in commands.iter().take(4) {
+        println!("  command  {}", crate::trunc(c, 100));
+    }
+    if commands.len() > 4 {
+        println!("  ({} different commands in all)", commands.len());
+    }
     println!();
 
     // Where it went. The log keeps only the busiest few peers per minute, so
@@ -310,6 +336,8 @@ mod tests {
             received,
             peers: peers.into(),
             path: String::new(),
+            parent: String::new(),
+            cmdline: String::new(),
         }
     }
 
