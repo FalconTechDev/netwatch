@@ -351,10 +351,7 @@ mod tests {
     /// battery the icon would silently disappear on a laptop.
     #[test]
     fn the_tray_runs_at_logon_for_the_user_without_elevation() {
-        let xml = tray_task_xml(
-            r"C:\Program Files\netwatch\netwatch-tray.exe",
-            r"HOME\user",
-        );
+        let xml = tray_task_xml(r"C:\Program Files\netwatch\netwatch-tray.exe", r"HOME\user");
         assert!(xml.contains("<LogonTrigger>"), "it starts at logon");
         assert!(
             xml.contains(r"<UserId>HOME\user</UserId>"),
